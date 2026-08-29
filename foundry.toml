@@ -1,0 +1,33 @@
+# QTIP protocol — Foundry config
+# Install toolchain:  curl -L https://foundry.paradigm.xyz | bash && foundryup
+# Install deps:       forge install foundry-rs/forge-std OpenZeppelin/openzeppelin-contracts
+
+[profile.default]
+src = "src"
+out = "out"
+libs = ["lib"]
+test = "test"
+script = "script"
+solc = "0.8.26"
+evm_version = "prague"      # enables the EIP-2537 BLS12-381 precompiles (live on RH, §13.2) for BlsDrandOracle tests
+optimizer = true
+optimizer_runs = 200
+bytecode_hash = "none"
+ffi = false
+fs_permissions = [{ access = "read", path = "./" }]
+
+# NOTE: the BLS precompile check (§13.2) is NOT a forge test — it calls the real RPC node
+# directly, because precompile presence is decided by the REMOTE chain, not this evm_version.
+# See script/bls_precompile_check.sh.
+
+[profile.ci]
+verbosity = 3
+fuzz = { runs = 1000 }
+
+[fmt]
+line_length = 110
+tab_width = 4
+bracket_spacing = true
+
+[rpc_endpoints]
+rh = "${RH_RPC_URL}"

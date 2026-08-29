@@ -1,0 +1,152 @@
+// SPDX-License-Identifier: MIT
+pragma solidity 0.8.26;
+
+import { IERC20 } from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
+import { SafeERC20 } from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
+import { IERC721Receiver } from "@openzeppelin/contracts/token/ERC721/IERC721Receiver.sol";
+import { Ownable } from "@openzeppelin/contracts/access/Ownable.sol";
+import { Ownable2Step } from "@openzeppelin/contracts/access/Ownable2Step.sol";
+import { ReentrancyGuard } from "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
+import { ISwapAdapter } from "./interfaces/ISwapAdapter.sol";
+
+/// @title  Treasury
+/// @notice Receives the QPULL tax and, on a batched `convert()`, turns it into prize inventory:
+///         QPULL → WETH (via adapter), team takes 25% in WETH, the remaining 75% → QUOTRON and is
+///         split to the three prize vaults (spec §3). Batching keeps Quotron's 3% hook fee (§9) off
+///         every trade — it is paid once per conversion.
+///
+/// @dev    Split, in bps of total tax: raffle 6125 / jackpot 625 / leaderboard 1250 / team 2000.
+///         Swaps route through ISwapAdapter with slippage bounds. `convert()` is permissionless
+///         (keeper-callable); slippage bounds protect it. Adapters and this Treasury MUST be
+///         tax-exempt on QPULLToken, or the protocol-side QPULL swap would itself be taxed.
+contract Treasury is Ownable2Step, ReentrancyGuard, IERC721Receiver {
+    using SafeERC20 for IERC20;
+
+    IERC20 public immutable qpull;
+    IERC20 public immutable weth;
+    IERC20 public immutable quotron;
+
+    uint256 internal constant BPS = 10_000;
+    uint256 public constant TEAM_BPS = 2000; // 20% of tax
+    uint256 public constant HOURLY_BPS = 6125; // 61.25% (daily raffle)
+    uint256 public constant JACKPOT_BPS = 625; // 6.25%
+    uint256 public constant LEADERBOARD_BPS = 1250; // 12.5% (doubled from 6.25%)
+    uint256 internal constant PRIZE_BPS = HOURLY_BPS + JACKPOT_BPS + LEADERBOARD_BPS; // 8000
+
+    ISwapAdapter public qpullWeth; // QPULL -> WETH
+    ISwapAdapter public wethQuotron; // WETH -> QUOTRON
+    address public prizeVault;
+    address public jackpotVault;
+    address public leaderboardVault;
+    address public team;
+
+    uint256 public convertThreshold; // min QPULL balance before convert() proceeds
+    mapping(address => bool) public isKeeper; // only an authorized keeper may trigger convert()
+
+    event AdaptersSet(address qpullWeth, address wethQuotron);
+    event RoutingSet(address prizeVault, address jackpotVault, address leaderboardVault, address team);
+    event ConvertThresholdSet(uint256 convertThreshold);
+    event KeeperSet(address indexed keeper, bool authorized);
+    event Converted(uint256 qpullIn, uint256 wethOut, uint256 quotronOut, uint256 teamWeth);
+
+    error NotConfigured();
+    error BelowThreshold();
+    error NotKeeper();
+
+    modifier onlyKeeper() {
+        if (!isKeeper[msg.sender]) revert NotKeeper();
+        _;
+    }
+
+    constructor(address qpull_, address weth_, address quotron_, address initialOwner) Ownable(initialOwner) {
+        qpull = IERC20(qpull_);
+        weth = IERC20(weth_);
+        quotron = IERC20(quotron_);
+    }
+
+    /// @notice Authorize/deauthorize a keeper allowed to call convert(). Gating convert() is the fix for
+    ///         the audit finding that a permissionless convert() with a caller-supplied slippage floor is
+    ///         sandwichable — only a trusted keeper that computes a tight off-chain minOut may trigger it.
+    function setKeeper(address k, bool v) external onlyOwner {
+        isKeeper[k] = v;
+        emit KeeperSet(k, v);
+    }
+
+    function setAdapters(address qpullWeth_, address wethQuotron_) external onlyOwner {
+        qpullWeth = ISwapAdapter(qpullWeth_);
+        wethQuotron = ISwapAdapter(wethQuotron_);
+        emit AdaptersSet(qpullWeth_, wethQuotron_);
+    }
+
+    function setRouting(address prize_, address jackpot_, address leaderboard_, address team_)
+        external
+        onlyOwner
+    {
+        prizeVault = prize_;
+        jackpotVault = jackpot_;
+        leaderboardVault = leaderboard_;
+        team = team_;
+        emit RoutingSet(prize_, jackpot_, leaderboard_, team_);
+    }
+
+    function setConvertThreshold(uint256 t) external onlyOwner {
+        convertThreshold = t;
+        emit ConvertThresholdSet(t);
+    }
+
+    /// @notice Batch-convert accumulated QPULL tax into prize inventory + team WETH. KEEPER-ONLY.
+    /// @param  minWethOut     slippage floor for QPULL→WETH, computed OFF-CHAIN by the keeper
+    /// @param  minQuotronOut  slippage floor for WETH→QUOTRON, computed OFF-CHAIN
+    /// @dev    Keeper-gated (onlyKeeper): the off-chain slippage floors are only trustworthy from a keeper
+    ///         that computes them tightly. A permissionless convert() would let an adversary pass a nominal
+    ///         floor (minOut=1) and sandwich the whole batch through the shallow pool — the audit finding
+    ///         this gate closes. The keeper account should be a bot key the team controls (rotatable).
+    function convert(uint256 minWethOut, uint256 minQuotronOut) external nonReentrant onlyKeeper {
+        if (
+            address(qpullWeth) == address(0) || address(wethQuotron) == address(0) || prizeVault == address(0)
+                || team == address(0)
+        ) revert NotConfigured();
+
+        uint256 qpullIn = qpull.balanceOf(address(this));
+        if (qpullIn < convertThreshold || qpullIn == 0) revert BelowThreshold();
+
+        // 1. QPULL -> WETH
+        qpull.forceApprove(address(qpullWeth), qpullIn);
+        uint256 wethOut =
+            qpullWeth.swapExactIn(address(qpull), address(weth), qpullIn, minWethOut, address(this));
+
+        // 2. team slice (WETH)
+        uint256 teamWeth = (wethOut * TEAM_BPS) / BPS;
+        weth.safeTransfer(team, teamWeth);
+        uint256 prizeWeth = wethOut - teamWeth;
+
+        // 3. prize WETH -> QUOTRON
+        weth.forceApprove(address(wethQuotron), prizeWeth);
+        uint256 qOut =
+            wethQuotron.swapExactIn(address(weth), address(quotron), prizeWeth, minQuotronOut, address(this));
+
+        // 4. split QUOTRON across the prize vaults (of the 7500 prize bps)
+        uint256 toJackpot = (qOut * JACKPOT_BPS) / PRIZE_BPS;
+        uint256 toLeaderboard = (qOut * LEADERBOARD_BPS) / PRIZE_BPS;
+        uint256 toHourly = qOut - toJackpot - toLeaderboard;
+        quotron.safeTransfer(prizeVault, toHourly);
+        quotron.safeTransfer(jackpotVault, toJackpot);
+        quotron.safeTransfer(leaderboardVault, toLeaderboard);
+
+        emit Converted(qpullIn, wethOut, qOut, teamWeth);
+    }
+
+    /// @notice ERC-404 terminal-mint safety (§13.3), defense-in-depth. A convert() batch that buys ≥1
+    ///         whole QUOTRON unit crosses a whole-unit boundary on receipt. test/fork/QuotronWholeUnitFork
+    ///         shows real QUOTRON does NOT fire a receiver callback on a plain contract (it appears to
+    ///         auto-exempt contracts from the NFT side), so convert() is safe without this. We implement
+    ///         it anyway — zero cost, uniform with the vaults, and a hedge if that exemption ever changes.
+    function onERC721Received(address, address, uint256, bytes calldata)
+        external
+        pure
+        override
+        returns (bytes4)
+    {
+        return IERC721Receiver.onERC721Received.selector;
+    }
+}
