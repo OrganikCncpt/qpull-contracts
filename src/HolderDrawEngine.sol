@@ -143,7 +143,9 @@ contract HolderDrawEngine is Ownable2Step, ReentrancyGuard {
         if (end > SUPPLY) end = SUPPLY;
         for (uint256 tid = cursor + 1; tid <= end; ++tid) {
             try nft.ownerOf(tid) returns (address o) {
-                snapOwner[buf][tid] = o;
+                // Freeze exclusion at snapshot time (audit H-7): an excluded owner is captured as address(0),
+                // so a post-snapshot setExcluded cannot re-roll this week's winners after the beacon is near.
+                snapOwner[buf][tid] = excluded[o] ? address(0) : o;
             } catch {
                 snapOwner[buf][tid] = address(0);
             }
@@ -180,7 +182,8 @@ contract HolderDrawEngine is Ownable2Step, ReentrancyGuard {
         uint256 len;
         for (uint256 tid = 1; tid <= SUPPLY; ++tid) {
             address o = snapOwner[buf][tid];
-            if (o != address(0) && !excluded[o]) {
+            if (o != address(0)) {
+                // exclusion was already frozen into the snapshot (excluded owners were captured as 0) — audit H-7
                 pool[len++] = tid;
             }
         }
@@ -209,13 +212,12 @@ contract HolderDrawEngine is Ownable2Step, ReentrancyGuard {
             winners[got++] = o;
         }
 
-        drawn[week] = true;
-
         if (got < WINNERS) {
             // Fewer than 5 distinct eligible wallets — pay nobody; the pot rolls forward (enforces EXACTLY 5).
             emit Voided(week, pot);
-            return;
+            return; // do NOT mark drawn (audit L-9: consistent with the zero-pot / incomplete-snapshot branches)
         }
+        drawn[week] = true;
 
         uint256 share = pot / WINNERS; // dust (pot % WINNERS) stays unreserved and rolls forward
         uint64 deadline = uint64(block.timestamp + CLAIM_WINDOW);

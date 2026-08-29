@@ -12,7 +12,7 @@ import { ILeaderboardRegistry } from "./interfaces/IRegistries.sol";
 ///
 /// @dev    Board maintenance is O(1) when the buyer is already on the board or the board isn't full,
 ///         and O(25) only when a newcomer displaces the current minimum. The board is unsorted —
-///         rank order doesn't matter because the payout √-weights all 25 members.
+///         rank order does not matter because the payout is pro-rata by points across all 25 members.
 contract LeaderboardRegistry is ILeaderboardRegistry, Ownable2Step {
     uint256 public immutable genesis;
     uint256 internal constant WEEK = 7 days;

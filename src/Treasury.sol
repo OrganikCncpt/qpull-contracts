@@ -11,7 +11,7 @@ import { ISwapAdapter } from "./interfaces/ISwapAdapter.sol";
 
 /// @title  Treasury
 /// @notice Receives the QPULL tax and, on a batched `convert()`, turns it into prize inventory:
-///         QPULL → WETH (via adapter), team takes 25% in WETH, the remaining 75% → QUOTRON and is
+///         QPULL → WETH (via adapter), team takes 20% in WETH, the remaining 80% → QUOTRON and is
 ///         split to the three prize vaults (spec §3). Batching keeps Quotron's 3% hook fee (§9) off
 ///         every trade — it is paid once per conversion.
 ///
@@ -52,6 +52,7 @@ contract Treasury is Ownable2Step, ReentrancyGuard, IERC721Receiver {
     error NotConfigured();
     error BelowThreshold();
     error NotKeeper();
+    error SwapShortfall();
 
     modifier onlyKeeper() {
         if (!isKeeper[msg.sender]) revert NotKeeper();
@@ -82,6 +83,12 @@ contract Treasury is Ownable2Step, ReentrancyGuard, IERC721Receiver {
         external
         onlyOwner
     {
+        if (
+            prize_ == address(0) || jackpot_ == address(0) || leaderboard_ == address(0)
+                || team_ == address(0)
+        ) {
+            revert NotConfigured(); // audit M-1: no zero routing destinations
+        }
         prizeVault = prize_;
         jackpotVault = jackpot_;
         leaderboardVault = leaderboard_;
@@ -104,28 +111,33 @@ contract Treasury is Ownable2Step, ReentrancyGuard, IERC721Receiver {
     function convert(uint256 minWethOut, uint256 minQuotronOut) external nonReentrant onlyKeeper {
         if (
             address(qpullWeth) == address(0) || address(wethQuotron) == address(0) || prizeVault == address(0)
-                || team == address(0)
-        ) revert NotConfigured();
+                || jackpotVault == address(0) || leaderboardVault == address(0) || team == address(0)
+        ) revert NotConfigured(); // audit M-1: jackpot/leaderboard vaults are unconditional transfer targets
 
         uint256 qpullIn = qpull.balanceOf(address(this));
         if (qpullIn < convertThreshold || qpullIn == 0) revert BelowThreshold();
 
-        // 1. QPULL -> WETH
+        // 1. QPULL -> WETH. Trust the MEASURED balance delta, not the adapter's return value (audit H-14):
+        //    a malicious/buggy adapter could take the approved QPULL and return a fabricated number.
+        uint256 wethBefore = weth.balanceOf(address(this));
         qpull.forceApprove(address(qpullWeth), qpullIn);
-        uint256 wethOut =
-            qpullWeth.swapExactIn(address(qpull), address(weth), qpullIn, minWethOut, address(this));
+        qpullWeth.swapExactIn(address(qpull), address(weth), qpullIn, minWethOut, address(this));
+        uint256 wethOut = weth.balanceOf(address(this)) - wethBefore;
+        if (wethOut < minWethOut) revert SwapShortfall();
 
         // 2. team slice (WETH)
         uint256 teamWeth = (wethOut * TEAM_BPS) / BPS;
         weth.safeTransfer(team, teamWeth);
         uint256 prizeWeth = wethOut - teamWeth;
 
-        // 3. prize WETH -> QUOTRON
+        // 3. prize WETH -> QUOTRON — measured delta again (audit H-14)
+        uint256 qBefore = quotron.balanceOf(address(this));
         weth.forceApprove(address(wethQuotron), prizeWeth);
-        uint256 qOut =
-            wethQuotron.swapExactIn(address(weth), address(quotron), prizeWeth, minQuotronOut, address(this));
+        wethQuotron.swapExactIn(address(weth), address(quotron), prizeWeth, minQuotronOut, address(this));
+        uint256 qOut = quotron.balanceOf(address(this)) - qBefore;
+        if (qOut < minQuotronOut) revert SwapShortfall();
 
-        // 4. split QUOTRON across the prize vaults (of the 7500 prize bps)
+        // 4. split QUOTRON across the prize vaults (of the 8000 prize bps)
         uint256 toJackpot = (qOut * JACKPOT_BPS) / PRIZE_BPS;
         uint256 toLeaderboard = (qOut * LEADERBOARD_BPS) / PRIZE_BPS;
         uint256 toHourly = qOut - toJackpot - toLeaderboard;

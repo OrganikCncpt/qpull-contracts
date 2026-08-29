@@ -99,9 +99,14 @@ contract RaffleEngine is Ownable2Step {
         // fix). We also don't mark the day drawn — a retry can still pay out if the vault is funded later
         // within this window; missing the whole window voids the day and the pot rolls forward.
         uint256 pot = vault.freeBalance();
-        if (pot == 0) {
-            emit DrawExecuted(day, 0, 0);
-            return;
+        // Skip (WITHOUT burning tickets or marking the day drawn) when the pot is too small to pay even a full
+        // field of winners in the SMALLEST tier bucket. This guarantees every drawn winner receives >=1 wei,
+        // so no ticket is ever spent for a zero payout (audit H-17; subsumes the old pot==0 guard). The
+        // smallest bucket is Common = pot*bucketBps(0)/BPS = pot/10; dividing it among up to winnersPerDay
+        // winners is >=1 exactly when smallestBucket >= winnersPerDay.
+        if ((pot * bucketBps(0)) / BPS < winnersPerDay) {
+            emit DrawExecuted(day, pot, 0);
+            return; // retry when the vault is funded within the still-open window
         }
 
         bytes32 beacon = drand.randomness(drawRound(day)); // reverts if beacon missing (retry within window)
@@ -125,17 +130,13 @@ contract RaffleEngine is Ownable2Step {
             }
         }
 
-        // Per-tier bucket amounts (unpaid buckets simply stay in the vault → next snapshot).
-        uint256[4] memory bucketAmt;
-        for (uint8 t; t < 4; ++t) {
-            bucketAmt[t] = (pot * bucketBps(t)) / BPS;
-        }
-
-        // Pass 2: write a claim to each winner for its equal share of its tier bucket.
+        // Pass 2: write a claim to each winner for its equal share of its tier bucket. Single combined
+        // division (audit L-14) — (pot·bps)/(BPS·count) — avoids the extra floor of a two-step divide.
+        // Unpaid buckets (tiers with no winner) simply stay in the vault → next snapshot.
         uint64 deadline = uint64(block.timestamp + CLAIM_WINDOW);
         for (uint256 i; i < n; ++i) {
             uint8 t = tiers[i];
-            uint256 prize = bucketAmt[t] / counts[t];
+            uint256 prize = (pot * bucketBps(t)) / (BPS * counts[t]);
             if (prize == 0) continue;
             claimManager.registerClaim(address(vault), packs.ownerOf(winners[i]), prize, deadline);
         }

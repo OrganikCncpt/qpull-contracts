@@ -43,9 +43,15 @@ src/
   HolderDrawEngine.sol   weekly NFT-holder draw (snapshot-before-beacon)
   NFTCollection.sol      limited NFT collection w/ rarity reveal
   adapters/              Uniswap V4 (QPULL/WETH) + router (WETH/QUOTRON) swappers
-  oracle/                BlsDrandOracle (primary) + committee/derp variants
+  oracle/                BlsDrandOracle (the sole time-locked randomness source)
   interfaces/            shared interfaces
 ```
+
+## Audit remediation
+
+This tree incorporates the fixes from a first-pass review — see **[SECURITY.md](SECURITY.md)**, which maps
+every finding to its resolution (fixed in code / resolved by the timelock+multisig governance model /
+accepted-bounded / removed / false-positive) and lists the launch-time operator steps.
 
 ## Build
 

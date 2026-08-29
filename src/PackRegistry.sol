@@ -44,7 +44,11 @@ contract PackRegistry is IPackRegistry, Ownable2Step {
     // ─── wiring ──────────────────────────────────────────────────────────────
     address public token; // QPULLToken — only caller of recordBuy
     address public engine; // RaffleEngine — only caller of drawFrom
-    uint256 public maxTicketsPerBuy = 1000; // gas bound on per-buy minting (hardening); excess value banks
+    // Gas bound on per-buy minting. At ~73k gas/pack a cap of 1000 needed ~73M gas — above the L2 block
+    // limit, so an ordinary large buy reverted (audit H-18). 100 keeps a full-cap buy well within a block;
+    // value above the cap is banked and mints on the buyer's next trade.
+    uint256 public constant MAX_TICKETS_CEILING = 200;
+    uint256 public maxTicketsPerBuy = 100;
 
     // ─── ticket state ────────────────────────────────────────────────────────
     struct Pack {
@@ -75,6 +79,7 @@ contract PackRegistry is IPackRegistry, Ownable2Step {
     event Drawn(uint32 indexed drawDay, uint256 count);
     event FreeEntriesClaimed(address indexed holder, uint32 indexed day, uint256 entries);
     event TicketPriceSet(uint256 oldPrice, uint256 newPrice);
+    event MaxTicketsPerBuySet(uint256 m);
 
     error NotToken();
     error NotEngine();
@@ -84,6 +89,8 @@ contract PackRegistry is IPackRegistry, Ownable2Step {
     error TicketPriceZero();
     error AdjustTooSoon();
     error AdjustOutOfBounds();
+    error ZeroDrand();
+    error BadMaxTickets();
 
     modifier onlyToken() {
         if (msg.sender != token) revert NotToken();
@@ -103,6 +110,7 @@ contract PackRegistry is IPackRegistry, Ownable2Step {
         address initialOwner
     ) Ownable(initialOwner) {
         if (ticketPrice_ == 0) revert TicketPriceZero();
+        if (drand_ == address(0)) revert ZeroDrand(); // audit M-17: oracle sits on the taxed-buy hot path
         drand = IDrandOracle(drand_);
         ticketPrice = ticketPrice_;
         genesis = genesis_;
@@ -125,8 +133,9 @@ contract PackRegistry is IPackRegistry, Ownable2Step {
     }
 
     function setMaxTicketsPerBuy(uint256 m) external onlyOwner {
-        require(m > 0, "zero");
+        if (m == 0 || m > MAX_TICKETS_CEILING) revert BadMaxTickets(); // audit H-18/L-5: bounded + event
         maxTicketsPerBuy = m;
+        emit MaxTicketsPerBuySet(m);
     }
 
     /// @notice Re-peg the ticket price to hold ~$10 of QPULL per ticket as QPULL's market price drifts

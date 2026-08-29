@@ -22,12 +22,18 @@ contract QuotronRouterAdapter is ISwapAdapter, Ownable2Step, ReentrancyGuard {
     IQuotronRouter public immutable router;
     address public immutable weth;
     address public immutable quotron;
+    address public treasury; // the ONLY authorized caller of swapExactIn (audit H-1)
     uint256 public deadlineBuffer = 15 minutes;
+    uint256 internal constant MAX_DEADLINE_BUFFER = 1 hours; // bound (audit L-7)
 
     event DeadlineBufferSet(uint256 seconds_);
+    event TreasurySet(address treasury);
 
     error UnsupportedPath();
     error MinOutRequired();
+    error NotTreasury();
+    error Slippage();
+    error BadBuffer();
 
     constructor(address router_, address weth_, address quotron_, address initialOwner)
         Ownable(initialOwner)
@@ -37,7 +43,14 @@ contract QuotronRouterAdapter is ISwapAdapter, Ownable2Step, ReentrancyGuard {
         quotron = quotron_;
     }
 
+    /// @notice Authorize the Treasury as the sole caller of swapExactIn (audit H-1). Set once at launch.
+    function setTreasury(address t) external onlyOwner {
+        treasury = t;
+        emit TreasurySet(t);
+    }
+
     function setDeadlineBuffer(uint256 s) external onlyOwner {
+        if (s == 0 || s > MAX_DEADLINE_BUFFER) revert BadBuffer(); // audit L-7: no overflow / zero deadline
         deadlineBuffer = s;
         emit DeadlineBufferSet(s);
     }
@@ -49,11 +62,13 @@ contract QuotronRouterAdapter is ISwapAdapter, Ownable2Step, ReentrancyGuard {
         nonReentrant
         returns (uint256 amountOut)
     {
+        if (msg.sender != treasury) revert NotTreasury(); // audit H-1
         if (tokenIn != weth || tokenOut != quotron) revert UnsupportedPath();
         if (minOut == 0) revert MinOutRequired(); // the router rejects minOut==0 (InvalidAmount) — always set a floor
         IERC20(weth).safeTransferFrom(msg.sender, address(this), amountIn);
         IWETH(weth).withdraw(amountIn); // WETH → native ETH
         amountOut = router.buyExactEth{ value: amountIn }(minOut, to, block.timestamp + deadlineBuffer);
+        if (amountOut < minOut) revert Slippage(); // audit M-3: enforce the floor locally, not only via the router
     }
 
     /// @inheritdoc ISwapAdapter

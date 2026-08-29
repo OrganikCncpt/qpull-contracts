@@ -13,8 +13,12 @@ import { IVault } from "./interfaces/IVault.sol";
 ///         the instruction of an authorized controller (an engine or the claim manager).
 ///         Tracks `unclaimedReserve` so `freeBalance` never counts prizes already owed (spec §8) —
 ///         the invariant that makes a pot structurally impossible to over-state.
-/// @dev    Deliberately has NO owner-drain path. The only owner power is authorizing controllers
-///         (set at launch, then renounce). This removes the obvious rug vector for an auditor.
+/// @dev    Reserved (already-owed) prizes are protected UNCONDITIONALLY: payOut reverts if it would dip
+///         into `unclaimedReserve`, so no controller — rogue or not — can pay out funds a winner has already
+///         claimed (audit H-8). The one owner power (authorizing controllers) can therefore reach at most
+///         genuinely FREE balance; keep controller-management behind a timelock/multisig and renounce after
+///         launch to close even that. (This supersedes the earlier "no owner-drain path" claim, which the
+///         audit correctly flagged as false.)
 contract BaseVault is IVault, IERC721Receiver, Ownable2Step {
     using SafeERC20 for IERC20;
 
@@ -53,6 +57,10 @@ contract BaseVault is IVault, IERC721Receiver, Ownable2Step {
 
     /// @inheritdoc IVault
     function payOut(address to, uint256 amount) external override onlyController {
+        // audit H-8: never move reserved balance. On the normal claim path release() runs first (lowering
+        // unclaimedReserve), so a legitimate payOut of a just-released claim still passes; a rogue controller
+        // can at most reach free balance and can NEVER touch funds already owed to winners.
+        if (amount + unclaimedReserve > quotron.balanceOf(address(this))) revert InsufficientFree();
         quotron.safeTransfer(to, amount);
         emit PaidOut(to, amount);
     }

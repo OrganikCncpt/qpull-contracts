@@ -7,8 +7,8 @@ import { IDrandOracle } from "../interfaces/IDrandOracle.sol";
 /// @notice Verifies drand **quicknet** beacons (scheme `bls-unchained-g1-rfc9380`) fully on-chain
 ///         using the EIP-2537 BLS12-381 precompiles (confirmed live on RH, spec §13.2). Anyone may
 ///         submit a beacon; only a signature that passes the pairing check against the drand group
-///         key is accepted — no relayers, no trust. This is the trustless upgrade over
-///         CommitteeDrandOracle, behind the same IDrandOracle interface.
+///         key is accepted — no relayers, no trust. The sole IDrandOracle implementation the protocol
+///         deploys (the committee/DERP alternates were removed as unused and non-time-locked).
 ///
 /// @dev    quicknet: sigs on G1 (48-byte compressed → submitted uncompressed, 128 bytes), pubkey on
 ///         G2, period 3s. Verify: e(H(m), pk) == e(sig, G2) where m = sha256(round_be8) and H is

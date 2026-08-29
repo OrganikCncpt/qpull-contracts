@@ -23,6 +23,11 @@ contract JackpotEngine is Ownable2Step {
 
     uint256 public constant PERIOD = 14 days;
     uint256 public constant CLAIM_WINDOW = 30 days;
+    // Owner-set bound on a single draw's payout (audit H-3B/M-9). Default uncapped for back-compat; the
+    // owner sets a concrete cap at launch (behind the timelock). Caps how much a delaying known-winner can
+    // absorb from the next period, and keeps a single QUOTRON prize within one-transfer gas. Excess rolls
+    // forward in the vault, like HolderDrawEngine's potCap.
+    uint256 public potCap = type(uint256).max;
     // The settling beacon is bound to a drand round REVEAL_LAG after entries close, so it is unknowable
     // while the last entry of the period is still recordable — even under block.timestamp manipulation
     // (a searcher would have to push block.timestamp a full hour into the past). Mirrors PackRegistry's
@@ -33,9 +38,11 @@ contract JackpotEngine is Ownable2Step {
     mapping(uint256 => bool) public drawn;
 
     event DrawExecuted(uint256 indexed period, uint256 pot, address indexed winner);
+    event PotCapSet(uint256 potCap);
 
     error AlreadyDrawn();
     error OutsideWindow();
+    error BadPotCap();
 
     constructor(
         address drand_,
@@ -54,6 +61,12 @@ contract JackpotEngine is Ownable2Step {
 
     /// @notice The drand round settling `period` — reveals REVEAL_LAG AFTER the period closes, so it is
     ///         unknowable while any in-period entry can still be recorded.
+    function setPotCap(uint256 c) external onlyOwner {
+        if (c == 0) revert BadPotCap();
+        potCap = c;
+        emit PotCapSet(c);
+    }
+
     function jackpotRound(uint256 period) public view returns (uint64) {
         return drand.roundAt(genesis + (period + 1) * PERIOD + REVEAL_LAG);
     }
@@ -68,14 +81,18 @@ contract JackpotEngine is Ownable2Step {
         if (currentPeriod() != period + 1) revert OutsideWindow();
 
         bytes32 beacon = drand.randomness(jackpotRound(period));
-        drawn[period] = true;
 
+        // Snapshot pot/total BEFORE marking drawn: for a winner-take-all jackpot, freeBalance()==0 is the
+        // normal state during a claim window, so marking drawn first would permanently void the period on a
+        // zero pot with no retry (audit H-3; matches RaffleEngine/HolderDrawEngine's deliberate handling).
         uint256 total = registry.periodTotal(period);
         uint256 pot = vault.freeBalance();
+        if (pot > potCap) pot = potCap; // audit H-3B/M-9: bound the single-draw payout; excess rolls forward
         if (total == 0 || pot == 0) {
             emit DrawExecuted(period, pot, address(0));
-            return;
+            return; // do NOT mark drawn
         }
+        drawn[period] = true;
 
         uint256 r = uint256(beacon) % total;
         address winner = registry.winnerAt(period, r);

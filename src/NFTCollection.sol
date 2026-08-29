@@ -13,7 +13,8 @@ import { INFTCollection } from "./interfaces/INFTCollection.sol";
 ///         locked buckets — 80% LP / 15% prize seed / 5% team (spec §16). Rarity is sealed at mint
 ///         and revealed against a future drand round (a "pack rip"), and drives the holder's free
 ///         daily raffle entries. The team can never withdraw more than its 5% — the split is enforced
-///         on-chain and the buckets only flow to their purpose via `finalizeLaunch()`.
+///         on-chain; rarities are sealed at `finalizeLaunch()` and the buckets are pulled to their purpose
+///         separately via `withdrawProceeds()` (so a bad payout recipient can never block the reveal).
 /// @dev    Rarity is probabilistic (Common 70 / Uncommon 20 / Rare 8 / Super Rare 2), so final tier
 ///         counts are approximate, not exact — a fair rip. (Exact counts would need a drand-seeded
 ///         shuffle; flagged as an option, not built.)
@@ -57,8 +58,9 @@ contract NFTCollection is INFTCollection, ERC721, Ownable2Step, ReentrancyGuard 
     error SoldOut();
     error BadPrice();
     error AlreadyLaunched();
+    error AlreadyMinting();
     error RecipientsUnset();
-    error SendFailed();
+    error NotLaunched();
     error NoToken();
 
     constructor(uint256 mintPrice_, address drand_, uint256 revealDelay_, address initialOwner)
@@ -78,6 +80,8 @@ contract NFTCollection is INFTCollection, ERC721, Ownable2Step, ReentrancyGuard 
     }
 
     function setRecipients(address lp, address seed, address team_) external onlyOwner {
+        if (totalMinted > 0) revert AlreadyMinting(); // audit H-12: destinations freeze before any ETH flows
+        if (lp == address(0) || seed == address(0) || team_ == address(0)) revert RecipientsUnset();
         lpTreasury = lp;
         seedTreasury = seed;
         team = team_;
@@ -121,36 +125,45 @@ contract NFTCollection is INFTCollection, ERC721, Ownable2Step, ReentrancyGuard 
 
     // ─── launch ──────────────────────────────────────────────────────────────
 
-    /// @notice Deploy the three locked buckets to their purposes. LP ETH → lpTreasury (locker),
-    ///         seed ETH → seedTreasury (buys QUOTRON, seeds vaults), team ETH → team.
+    /// @notice Seal ALL rarities to ONE future, time-locked round and close the launch. Deliberately moves
+    ///         NO ETH (audit H-13): the reveal — and therefore rarityOf and holder free-entries — can never
+    ///         be blocked by a reverting payout recipient. Proceeds are pulled separately via withdrawProceeds.
+    /// @dev    The round is unknowable during the mint (it didn't exist yet), revealed revealDelay later;
+    ///         one beacon reveals the whole collection (BLS keeper efficiency, the audit #4 fix under a
+    ///         time-locked oracle).
     function finalizeLaunch() external onlyOwner nonReentrant {
         if (launched) revert AlreadyLaunched();
         if (lpTreasury == address(0) || seedTreasury == address(0) || team == address(0)) {
             revert RecipientsUnset();
         }
         launched = true;
-        // Seal ALL rarities to ONE future, time-locked round now that minting is closed: unknowable during
-        // the mint (this round didn't exist yet), revealed revealDelay later. One beacon reveals the whole
-        // collection — BLS keeper efficiency, and the audit #4 fix under a time-locked oracle.
         revealRound = drand.roundAt(block.timestamp + revealDelay);
-
-        uint256 lp = lpReserve;
-        uint256 seed = seedReserve;
-        uint256 t = teamReserve;
-        lpReserve = 0;
-        seedReserve = 0;
-        teamReserve = 0;
-
-        _send(lpTreasury, lp);
-        _send(seedTreasury, seed);
-        _send(team, t);
-        emit Launched(lp, seed, t);
+        emit Launched(lpReserve, seedReserve, teamReserve);
     }
 
-    function _send(address to, uint256 amount) internal {
-        if (amount == 0) return;
-        (bool ok,) = to.call{ value: amount }("");
-        if (!ok) revert SendFailed();
+    /// @notice Disburse the three launch buckets to their (frozen) recipients — each INDEPENDENTLY (audit
+    ///         H-13): a recipient that reverts leaves only its own bucket for a later retry and never blocks
+    ///         the others or the reveal. Permissionless once launched; destinations are fixed.
+    function withdrawProceeds() external nonReentrant {
+        if (!launched) revert NotLaunched();
+        uint256 lp = lpReserve;
+        if (lp > 0) {
+            lpReserve = 0;
+            (bool ok,) = lpTreasury.call{ value: lp }("");
+            if (!ok) lpReserve = lp; // restore for retry; other buckets still flow
+        }
+        uint256 seed = seedReserve;
+        if (seed > 0) {
+            seedReserve = 0;
+            (bool ok,) = seedTreasury.call{ value: seed }("");
+            if (!ok) seedReserve = seed;
+        }
+        uint256 t = teamReserve;
+        if (t > 0) {
+            teamReserve = 0;
+            (bool ok,) = team.call{ value: t }("");
+            if (!ok) teamReserve = t;
+        }
     }
 
     // INFTCollection.ownerOf/balanceOf are inherited from ERC721.

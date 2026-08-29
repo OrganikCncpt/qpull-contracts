@@ -37,6 +37,9 @@ contract ClaimManager is IClaimManager, Ownable2Step, ReentrancyGuard {
     error AlreadySettled();
     error Expired();
     error NotExpired();
+    error ZeroRecipient();
+    error BadDeadline();
+    error NotRegistered();
 
     constructor(address initialOwner) Ownable(initialOwner) { }
 
@@ -52,6 +55,8 @@ contract ClaimManager is IClaimManager, Ownable2Step, ReentrancyGuard {
         returns (uint256 id)
     {
         if (!isEngine[msg.sender]) revert NotEngine();
+        if (recipient == address(0)) revert ZeroRecipient(); // audit L-1
+        if (deadline <= block.timestamp) revert BadDeadline(); // audit L-1
         IVault(vault).reserve(amount); // reserves against free balance — reverts if insufficient
         id = ++nextClaimId;
         claims[id] = Claim(vault, recipient, amount, deadline, false);
@@ -96,6 +101,7 @@ contract ClaimManager is IClaimManager, Ownable2Step, ReentrancyGuard {
     /// @notice After the window closes, return an unclaimed prize to the vault (rolls into future pots).
     function sweepExpired(uint256 id) external nonReentrant {
         Claim storage c = claims[id];
+        if (c.vault == address(0)) revert NotRegistered(); // audit L-2: explicit guard, not an incidental revert
         if (c.settled) revert AlreadySettled();
         if (block.timestamp <= c.deadline) revert NotExpired();
         c.settled = true;

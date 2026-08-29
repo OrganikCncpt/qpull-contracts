@@ -39,14 +39,17 @@ contract QpullWethAdapter is ISwapAdapter, IUnlockCallback, Ownable2Step, Reentr
 
     PoolKey public poolKey; // the QPULL/WETH pool — set at launch, once it exists
     bool public poolKeySet;
+    address public treasury; // the ONLY authorized caller of swapExactIn (audit H-1)
 
     event PoolKeySet(address currency0, address currency1, uint24 fee, int24 tickSpacing, address hooks);
+    event TreasurySet(address treasury);
 
     error UnsupportedPath();
     error MinOutRequired();
     error PoolKeyUnset();
     error NotPoolManager();
     error Slippage();
+    error NotTreasury();
 
     constructor(address poolManager_, address qpull_, address weth_, address initialOwner)
         Ownable(initialOwner)
@@ -66,6 +69,15 @@ contract QpullWethAdapter is ISwapAdapter, IUnlockCallback, Ownable2Step, Reentr
         );
     }
 
+    /// @notice Authorize the Treasury as the sole caller of swapExactIn. This adapter MUST be tax-exempt on
+    ///         QPULLToken for convert() to work; without this gate ANY address could route a QPULL->WETH sell
+    ///         through it and pay 0% tax instead of 4% (audit H-1). Set once to the deployed Treasury at
+    ///         launch. Until set, swapExactIn is closed (fail-safe).
+    function setTreasury(address t) external onlyOwner {
+        treasury = t;
+        emit TreasurySet(t);
+    }
+
     /// @inheritdoc ISwapAdapter
     function swapExactIn(address tokenIn, address tokenOut, uint256 amountIn, uint256 minOut, address to)
         external
@@ -73,6 +85,7 @@ contract QpullWethAdapter is ISwapAdapter, IUnlockCallback, Ownable2Step, Reentr
         nonReentrant
         returns (uint256 amountOut)
     {
+        if (msg.sender != treasury) revert NotTreasury(); // audit H-1: no public tax-free sell route
         if (tokenIn != qpull || tokenOut != weth) revert UnsupportedPath();
         if (minOut == 0) revert MinOutRequired(); // never swap unguarded
         if (!poolKeySet) revert PoolKeyUnset();
