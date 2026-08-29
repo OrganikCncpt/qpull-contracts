@@ -10,15 +10,16 @@ import { ReentrancyGuard } from "@openzeppelin/contracts/utils/ReentrancyGuard.s
 import { ISwapAdapter } from "./interfaces/ISwapAdapter.sol";
 
 /// @title  Treasury
-/// @notice Receives the QPULL tax and, on a batched `convert()`, turns it into prize inventory:
-///         QPULL → WETH (via adapter), team takes 20% in WETH, the remaining 80% → QUOTRON and is
-///         split to the three prize vaults (spec §3). Batching keeps Quotron's 3% hook fee (§9) off
-///         every trade — it is paid once per conversion.
+/// @notice Receives the 4% trade tax from QpullTaxHook — in QPULL (buys) AND WETH (exact-in sells,
+///         audit H-2) — and, on a batched `convert()`, turns it into prize inventory: QPULL → WETH
+///         (via adapter), team takes 20% of all WETH, the remaining 80% → QUOTRON and is split to
+///         the three prize vaults (spec §3). Batching keeps Quotron's 3% hook fee (§9) off every
+///         trade — it is paid once per conversion.
 ///
 /// @dev    Split, in bps of total tax: raffle 6125 / jackpot 625 / leaderboard 1250 / team 2000.
-///         Swaps route through ISwapAdapter with slippage bounds. `convert()` is permissionless
-///         (keeper-callable); slippage bounds protect it. Adapters and this Treasury MUST be
-///         tax-exempt on QPULLToken, or the protocol-side QPULL swap would itself be taxed.
+///         Swaps route through ISwapAdapter with slippage bounds, keeper-gated (see convert()).
+///         The QpullWethAdapter is fee-exempt on the hook (exemptSender), so the protocol-side
+///         QPULL→WETH conversion swap is itself untaxed.
 contract Treasury is Ownable2Step, ReentrancyGuard, IERC721Receiver {
     using SafeERC20 for IERC20;
 
@@ -41,11 +42,16 @@ contract Treasury is Ownable2Step, ReentrancyGuard, IERC721Receiver {
     address public team;
 
     uint256 public convertThreshold; // min QPULL balance before convert() proceeds
+    // Max QPULL swapped per convert() call. Default uncapped; the owner sets a pool-sized ceiling at launch so
+    // an untaxed donation that inflates the balance beyond pool depth can't permanently brick convert() — the
+    // keeper just drains the excess over several pool-sized slices (audit H-3). Excess stays as QPULL balance.
+    uint256 public maxConvertPerCall = type(uint256).max;
     mapping(address => bool) public isKeeper; // only an authorized keeper may trigger convert()
 
     event AdaptersSet(address qpullWeth, address wethQuotron);
     event RoutingSet(address prizeVault, address jackpotVault, address leaderboardVault, address team);
     event ConvertThresholdSet(uint256 convertThreshold);
+    event MaxConvertPerCallSet(uint256 maxConvertPerCall);
     event KeeperSet(address indexed keeper, bool authorized);
     event Converted(uint256 qpullIn, uint256 wethOut, uint256 quotronOut, uint256 teamWeth);
 
@@ -101,6 +107,14 @@ contract Treasury is Ownable2Step, ReentrancyGuard, IERC721Receiver {
         emit ConvertThresholdSet(t);
     }
 
+    /// @notice Ceiling on QPULL swapped per convert() call (audit H-3). Lets the keeper drain a donation-
+    ///         inflated balance in pool-sized slices instead of bricking on a single oversized swap.
+    function setMaxConvertPerCall(uint256 m) external onlyOwner {
+        if (m == 0) revert BelowThreshold();
+        maxConvertPerCall = m;
+        emit MaxConvertPerCallSet(m);
+    }
+
     /// @notice Batch-convert accumulated QPULL tax into prize inventory + team WETH. KEEPER-ONLY.
     /// @param  minWethOut     slippage floor for QPULL→WETH, computed OFF-CHAIN by the keeper
     /// @param  minQuotronOut  slippage floor for WETH→QUOTRON, computed OFF-CHAIN
@@ -114,18 +128,36 @@ contract Treasury is Ownable2Step, ReentrancyGuard, IERC721Receiver {
                 || jackpotVault == address(0) || leaderboardVault == address(0) || team == address(0)
         ) revert NotConfigured(); // audit M-1: jackpot/leaderboard vaults are unconditional transfer targets
 
-        uint256 qpullIn = qpull.balanceOf(address(this));
-        if (qpullIn < convertThreshold || qpullIn == 0) revert BelowThreshold();
+        // Tax arrives in TWO currencies since the V4 hook (audit H-2): buys pay QPULL, exact-in sells
+        // pay WETH — QpullTaxHook take()s both straight to this Treasury. QPULL converts via leg 1;
+        // WETH already held merges into the flow after it.
+        uint256 qpullBal = qpull.balanceOf(address(this));
+        uint256 wethHeld = weth.balanceOf(address(this));
+        // Gate on the RAW balance, THEN cap the slice. convertThreshold is a MIN-BATCH gate ("enough tax
+        // accumulated to amortize the swap"); maxConvertPerCall is a MAX-SLICE safety ("don't swap more
+        // than pool depth per call", audit H-3). These are independent — testing the threshold against
+        // the already-capped slice would let any config with maxConvertPerCall < convertThreshold strand
+        // the QPULL leg forever (H-2 review, hardened): the slice can never reach the threshold, so the
+        // QPULL→WETH conversion never runs even with a huge balance.
+        bool qpullLeg = qpullBal > 0 && qpullBal >= convertThreshold;
+        uint256 qpullIn = qpullBal > maxConvertPerCall ? maxConvertPerCall : qpullBal; // pool-sized slice
+        // Sub-threshold QPULL waits for more tax; a WETH-only sweep is always allowed (threshold is an
+        // anti-dust backstop for the QPULL swap leg, and convert() is keeper-gated anyway).
+        if (!qpullLeg && wethHeld == 0) revert BelowThreshold();
 
         // 1. QPULL -> WETH. Trust the MEASURED balance delta, not the adapter's return value (audit H-14):
         //    a malicious/buggy adapter could take the approved QPULL and return a fabricated number.
-        uint256 wethBefore = weth.balanceOf(address(this));
-        qpull.forceApprove(address(qpullWeth), qpullIn);
-        qpullWeth.swapExactIn(address(qpull), address(weth), qpullIn, minWethOut, address(this));
-        uint256 wethOut = weth.balanceOf(address(this)) - wethBefore;
-        if (wethOut < minWethOut) revert SwapShortfall();
+        if (qpullLeg) {
+            uint256 wethBefore = weth.balanceOf(address(this));
+            qpull.forceApprove(address(qpullWeth), qpullIn);
+            qpullWeth.swapExactIn(address(qpull), address(weth), qpullIn, minWethOut, address(this));
+            if (weth.balanceOf(address(this)) - wethBefore < minWethOut) revert SwapShortfall();
+        } else {
+            qpullIn = 0; // nothing swapped this call
+        }
 
-        // 2. team slice (WETH)
+        // 2. team slice — 20% of ALL tax revenue this batch, whichever currency it arrived in
+        uint256 wethOut = weth.balanceOf(address(this)); // swapped + hook-fee WETH; all of it is tax
         uint256 teamWeth = (wethOut * TEAM_BPS) / BPS;
         weth.safeTransfer(team, teamWeth);
         uint256 prizeWeth = wethOut - teamWeth;

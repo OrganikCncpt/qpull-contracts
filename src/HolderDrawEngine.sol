@@ -11,11 +11,13 @@ import { INFTCollection } from "./interfaces/INFTCollection.sol";
 
 /// @title  HolderDrawEngine — weekly NFT-holder jackpot, 5 distinct winners, even split
 /// @notice A weekly draw over the 250-piece NFT collection: each week it FREEZES who owns each tokenId
-///         (on-chain, BEFORE the beacon exists), then draws 5 DISTINCT winner wallets and pays each pot/5
+///         (on-chain, BEFORE the beacon exists), then draws 5 winning tokenId slots and pays each slot's owner pot/5
 ///         in QUOTRON from a dedicated vault. Funded once from the NFT-mint prize-seed (finite, bounded).
 ///
 /// @dev    The four guardrails (from the design red-team) all hold, and are the reason to build it this way:
-///         G1 (distinct 5): the draw skips any wallet already selected — no wallet takes >1 of 5 slots.
+///         G1 (proportional 5 slots): the draw picks 5 distinct tokenId SLOTS, so a wallet's expected slots
+///           are LINEAR in the tokens it holds — splitting a holding across wallets confers no advantage
+///           (sybil-neutral; audit H-4). A wallet holding several winning tokenIds wins several shares.
 ///         G2 (unpredictable): the seed is a TIME-LOCKED drand-BLS round that publishes REVEAL_LAG AFTER
 ///           snapDeadline(W); it cannot be known while the snapshot is open. MUST be a BlsDrandOracle —
 ///           DERP's on-demand model breaks this.
@@ -47,6 +49,10 @@ contract HolderDrawEngine is Ownable2Step, ReentrancyGuard {
 
     uint256 public potCap; // owner re-pegs within bounds; clamped by POT_CAP_CEILING
     uint64 public lastPotAdjust;
+    // Owner-set MINIMUM pot below which a draw voids WITHOUT consuming the week — closes the dust-donation
+    // grief where anyone raises freeBalance() by a few wei to force a zero/near-zero payout that burns the
+    // week (audit C-1). Default 0 => MUST be set at launch (runbook).
+    uint256 public minPot;
 
     // Double-buffered by week parity so week W+1's snapshot can't clobber week W's frozen buffer.
     mapping(uint256 => mapping(uint256 => address)) internal snapOwner; // [W&1][tokenId] => frozen owner
@@ -60,6 +66,7 @@ contract HolderDrawEngine is Ownable2Step, ReentrancyGuard {
     event Drawn(uint256 indexed week, uint256 pot, uint256 winners);
     event Voided(uint256 indexed week, uint256 pot);
     event PotCapSet(uint256 oldCap, uint256 newCap);
+    event MinPotSet(uint256 minPot);
     event ExcludedSet(address indexed account, bool excluded);
 
     error BadPotCap();
@@ -170,9 +177,9 @@ contract HolderDrawEngine is Ownable2Step, ReentrancyGuard {
         // Snapshot pot BEFORE anything else; a zero pot doesn't consume the draw (retry if funded in-window).
         uint256 pot = vault.freeBalance();
         if (pot > potCap) pot = potCap;
-        if (pot == 0) {
-            emit Drawn(week, 0, 0);
-            return; // do NOT mark drawn
+        if (pot < minPot || pot / WINNERS == 0) {
+            emit Drawn(week, pot, 0);
+            return; // do NOT mark drawn (audit C-1: sub-minPot or per-winner-zero dust never consumes the week)
         }
 
         bytes32 beacon = drand.randomness(drawRound(week)); // reverts until the time-locked round reveals
@@ -188,41 +195,31 @@ contract HolderDrawEngine is Ownable2Step, ReentrancyGuard {
             }
         }
 
-        // Select up to WINNERS distinct winner WALLETS by swap-pop; skip a wallet already chosen (G1).
-        address[WINNERS] memory winners;
-        uint256 got;
-        uint256 nonce;
-        while (got < WINNERS && len > 0) {
-            uint256 r = uint256(keccak256(abi.encode(beacon, week, nonce))) % len;
-            uint256 tid = pool[r];
-            pool[r] = pool[len - 1];
-            unchecked {
-                --len;
-                ++nonce;
-            }
-            address o = snapOwner[buf][tid];
-            bool dup;
-            for (uint256 i; i < got; ++i) {
-                if (winners[i] == o) {
-                    dup = true;
-                    break;
-                }
-            }
-            if (dup) continue;
-            winners[got++] = o;
-        }
-
-        if (got < WINNERS) {
-            // Fewer than 5 distinct eligible wallets — pay nobody; the pot rolls forward (enforces EXACTLY 5).
+        // Select WINNERS distinct tokenId SLOTS by swap-pop (audit H-4). Payout is linear in tokens held, so
+        // splitting a holding across wallets confers NO advantage (sybil-neutral) — unlike the old distinct-
+        // wallet rule, which paradoxically rewarded splitting. A wallet owning several winning tokenIds simply
+        // wins several pot/WINNERS shares, which is fair: it holds more of the collection.
+        if (len < WINNERS) {
+            // Fewer than 5 eligible tokenIds this week — pay nobody; the pot rolls forward.
             emit Voided(week, pot);
             return; // do NOT mark drawn (audit L-9: consistent with the zero-pot / incomplete-snapshot branches)
         }
+        uint256[WINNERS] memory wonTids;
+        for (uint256 i; i < WINNERS; ++i) {
+            uint256 r = uint256(keccak256(abi.encode(beacon, week, i))) % len;
+            wonTids[i] = pool[r];
+            pool[r] = pool[len - 1];
+            unchecked {
+                --len;
+            }
+        }
+
         drawn[week] = true;
 
         uint256 share = pot / WINNERS; // dust (pot % WINNERS) stays unreserved and rolls forward
         uint64 deadline = uint64(block.timestamp + CLAIM_WINDOW);
         for (uint256 i; i < WINNERS; ++i) {
-            claimManager.registerClaim(address(vault), winners[i], share, deadline);
+            claimManager.registerClaim(address(vault), snapOwner[buf][wonTids[i]], share, deadline);
         }
         emit Drawn(week, pot, WINNERS);
     }
@@ -242,6 +239,12 @@ contract HolderDrawEngine is Ownable2Step, ReentrancyGuard {
         lastPotAdjust = uint64(block.timestamp);
         potCap = newCap;
         emit PotCapSet(cur, newCap);
+    }
+
+    /// @notice Set the minimum pot below which a draw voids without consuming the week (audit C-1).
+    function setMinPot(uint256 m) external onlyOwner {
+        minPot = m;
+        emit MinPotSet(m);
     }
 
     function setExcluded(address account, bool v) external onlyOwner {

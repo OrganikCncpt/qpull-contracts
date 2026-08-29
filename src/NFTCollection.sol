@@ -62,11 +62,15 @@ contract NFTCollection is INFTCollection, ERC721, Ownable2Step, ReentrancyGuard 
     error RecipientsUnset();
     error NotLaunched();
     error NoToken();
+    error ZeroDrand();
+    error BadRevealDelay();
 
     constructor(uint256 mintPrice_, address drand_, uint256 revealDelay_, address initialOwner)
         ERC721("QPULL Terminal", "QPULLN")
         Ownable(initialOwner)
     {
+        if (drand_ == address(0)) revert ZeroDrand(); // audit L-7
+        if (revealDelay_ < 1 hours) revert BadRevealDelay(); // audit H-7: seal margin >= the engines' REVEAL_LAG
         mintPrice = mintPrice_;
         drand = IDrandOracle(drand_);
         revealDelay = revealDelay_;
@@ -96,16 +100,23 @@ contract NFTCollection is INFTCollection, ERC721, Ownable2Step, ReentrancyGuard 
 
     function mint() external payable nonReentrant {
         if (!mintOpen || launched) revert MintClosed();
+        // audit H-1: recipients MUST be set before any mint — otherwise the first mint freezes setRecipients
+        // (AlreadyMinting) and finalizeLaunch (RecipientsUnset) forever, permanently locking proceeds AND the
+        // rarity reveal (which cascades into PackRegistry.claimFreeEntries reverting for every holder).
+        if (lpTreasury == address(0) || seedTreasury == address(0) || team == address(0)) {
+            revert RecipientsUnset();
+        }
         if (totalMinted >= MAX_SUPPLY) revert SoldOut();
         if (msg.value != mintPrice) revert BadPrice();
 
         uint256 id = ++totalMinted; // ids 1..250 (rarity is sealed collection-wide at finalizeLaunch)
 
-        uint256 lp = (msg.value * LP_BPS) / BPS;
+        // Split 80/15/5. Team is the EXACT 5%; LP absorbs any rounding dust so team is never > 5% (audit L-17).
         uint256 seed = (msg.value * SEED_BPS) / BPS;
-        lpReserve += lp;
+        uint256 teamCut = (msg.value * (BPS - LP_BPS - SEED_BPS)) / BPS;
+        lpReserve += msg.value - seed - teamCut;
         seedReserve += seed;
-        teamReserve += msg.value - lp - seed;
+        teamReserve += teamCut;
 
         _safeMint(msg.sender, id);
         emit Minted(id, msg.sender);

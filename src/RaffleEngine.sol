@@ -32,19 +32,25 @@ contract RaffleEngine is Ownable2Step {
     // is still buyable — otherwise a last-second buyer could grind entries against a now-public beacon
     // (audit-2 root cause; mirrors PackRegistry's revealDelay).
     uint256 internal constant REVEAL_LAG = 1 hours;
-    uint256 public constant MAX_K = 1000;
+    uint256 public constant MAX_K = 200; // audit M-3: one-block-safe (was 1000; ~120-140k gas/winner)
     uint256 internal constant BPS = 10_000;
 
     uint256 public winnersPerDay; // K
+    // Owner-set MINIMUM pot below which a draw voids WITHOUT consuming the day or burning tickets — closes
+    // the dust-donation grief where anyone raises freeBalance() to force a draw that burns live tickets for
+    // ~1-wei prizes (audit C-1). Default 0 => MUST be set at launch (runbook).
+    uint256 public minPot;
     mapping(uint32 => bool) public drawn;
 
     event WinnersPerDaySet(uint256 k);
     event DrawExecuted(uint32 indexed day, uint256 pot, uint256 winners);
+    event MinPotSet(uint256 minPot);
 
     error AlreadyDrawn();
     error BadDay();
     error OutsideWindow();
     error BadK();
+    error GenesisMismatch();
 
     constructor(
         address drand_,
@@ -59,6 +65,7 @@ contract RaffleEngine is Ownable2Step {
         packs = PackRegistry(packs_);
         vault = IVault(vault_);
         claimManager = IClaimManager(claim_);
+        if (PackRegistry(packs_).genesis() != genesis_) revert GenesisMismatch(); // audit H-8
         genesis = genesis_;
         if (k_ == 0 || k_ > MAX_K) revert BadK();
         winnersPerDay = k_;
@@ -68,6 +75,12 @@ contract RaffleEngine is Ownable2Step {
         if (k == 0 || k > MAX_K) revert BadK();
         winnersPerDay = k;
         emit WinnersPerDaySet(k);
+    }
+
+    /// @notice Set the minimum pot below which a draw voids without consuming the day (audit C-1).
+    function setMinPot(uint256 m) external onlyOwner {
+        minPot = m;
+        emit MinPotSet(m);
     }
 
     /// @notice The drand round whose beacon settles day `day` — publishes REVEAL_LAG after day+1 opens,
@@ -104,9 +117,9 @@ contract RaffleEngine is Ownable2Step {
         // so no ticket is ever spent for a zero payout (audit H-17; subsumes the old pot==0 guard). The
         // smallest bucket is Common = pot*bucketBps(0)/BPS = pot/10; dividing it among up to winnersPerDay
         // winners is >=1 exactly when smallestBucket >= winnersPerDay.
-        if ((pot * bucketBps(0)) / BPS < winnersPerDay) {
+        if (pot < minPot || (pot * bucketBps(0)) / BPS < winnersPerDay) {
             emit DrawExecuted(day, pot, 0);
-            return; // retry when the vault is funded within the still-open window
+            return; // retry when funded (audit C-1: sub-minPot dust never consumes the day or burns tickets)
         }
 
         bytes32 beacon = drand.randomness(drawRound(day)); // reverts if beacon missing (retry within window)

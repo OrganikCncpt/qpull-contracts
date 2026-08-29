@@ -54,7 +54,13 @@ contract BlsDrandOracle is IDrandOracle {
     error InvalidBeacon();
     error PrecompileFailed();
 
+    error BadDrandParams();
+
     constructor(uint256 drandGenesis_, uint256 drandPeriod_) {
+        // audit H-6/L-11: pin the drand SCHEDULE constants to quicknet, exactly like the crypto constants
+        // (PK/DST/NEG_G2/P) are hardcoded. A wrong genesis/period doesn't revert anything — beacons still
+        // verify — but silently shifts every reveal window, making draws predictable. period==0 also panics.
+        if (drandGenesis_ != 1_692_803_367 || drandPeriod_ != 3) revert BadDrandParams();
         drandGenesis = drandGenesis_;
         drandPeriod = drandPeriod_;
     }

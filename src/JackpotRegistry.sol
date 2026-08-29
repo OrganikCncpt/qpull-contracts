@@ -18,7 +18,7 @@ contract JackpotRegistry is IJackpotRegistry, Ownable2Step {
     uint256 public immutable genesis;
     uint256 public constant PERIOD = 14 days;
 
-    address public token; // QPULLToken — only caller of recordTrade
+    address public recorder; // QpullTaxHook — only caller of recordTrade
 
     struct Seg {
         uint256 cumEnd; // running cumulative entry total up to and including this trade
@@ -28,13 +28,13 @@ contract JackpotRegistry is IJackpotRegistry, Ownable2Step {
     mapping(uint256 => Seg[]) internal segs; // period => segments
     mapping(uint256 => uint256) public periodTotal; // period => total entries
 
-    event TokenSet(address token);
+    event RecorderSet(address recorder);
     event Entry(uint256 indexed period, address indexed trader, uint256 amount, uint256 periodTotal);
 
-    error NotToken();
+    error NotRecorder();
 
-    modifier onlyToken() {
-        if (msg.sender != token) revert NotToken();
+    modifier onlyRecorder() {
+        if (msg.sender != recorder) revert NotRecorder();
         _;
     }
 
@@ -42,13 +42,13 @@ contract JackpotRegistry is IJackpotRegistry, Ownable2Step {
         genesis = genesis_;
     }
 
-    function setToken(address t) external onlyOwner {
-        token = t;
-        emit TokenSet(t);
+    function setRecorder(address t) external onlyOwner {
+        recorder = t;
+        emit RecorderSet(t);
     }
 
     /// @inheritdoc IJackpotRegistry
-    function recordTrade(address trader, uint256 grossValue) external override onlyToken {
+    function recordTrade(address trader, uint256 grossValue) external override onlyRecorder {
         if (grossValue == 0) return;
         uint256 p = _period();
         uint256 newTotal = periodTotal[p] + grossValue;

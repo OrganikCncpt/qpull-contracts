@@ -28,6 +28,10 @@ contract JackpotEngine is Ownable2Step {
     // absorb from the next period, and keeps a single QUOTRON prize within one-transfer gas. Excess rolls
     // forward in the vault, like HolderDrawEngine's potCap.
     uint256 public potCap = type(uint256).max;
+    // Owner-set MINIMUM pot below which a draw voids WITHOUT consuming the period — closes the dust-donation
+    // grief where anyone raises freeBalance() by a few wei to force a 1-wei winner and roll the real 14-day
+    // pot forward (audit C-1). Default 0 => MUST be set at launch (runbook), like potCap.
+    uint256 public minPot;
     // The settling beacon is bound to a drand round REVEAL_LAG after entries close, so it is unknowable
     // while the last entry of the period is still recordable — even under block.timestamp manipulation
     // (a searcher would have to push block.timestamp a full hour into the past). Mirrors PackRegistry's
@@ -39,10 +43,12 @@ contract JackpotEngine is Ownable2Step {
 
     event DrawExecuted(uint256 indexed period, uint256 pot, address indexed winner);
     event PotCapSet(uint256 potCap);
+    event MinPotSet(uint256 minPot);
 
     error AlreadyDrawn();
     error OutsideWindow();
     error BadPotCap();
+    error GenesisMismatch();
 
     constructor(
         address drand_,
@@ -56,6 +62,7 @@ contract JackpotEngine is Ownable2Step {
         registry = JackpotRegistry(registry_);
         vault = IVault(vault_);
         claimManager = IClaimManager(claim_);
+        if (JackpotRegistry(registry_).genesis() != genesis_) revert GenesisMismatch(); // audit H-8
         genesis = genesis_;
     }
 
@@ -65,6 +72,12 @@ contract JackpotEngine is Ownable2Step {
         if (c == 0) revert BadPotCap();
         potCap = c;
         emit PotCapSet(c);
+    }
+
+    /// @notice Set the minimum pot below which a draw voids without consuming the period (audit C-1).
+    function setMinPot(uint256 m) external onlyOwner {
+        minPot = m;
+        emit MinPotSet(m);
     }
 
     function jackpotRound(uint256 period) public view returns (uint64) {
@@ -88,9 +101,9 @@ contract JackpotEngine is Ownable2Step {
         uint256 total = registry.periodTotal(period);
         uint256 pot = vault.freeBalance();
         if (pot > potCap) pot = potCap; // audit H-3B/M-9: bound the single-draw payout; excess rolls forward
-        if (total == 0 || pot == 0) {
+        if (total == 0 || pot == 0 || pot < minPot) {
             emit DrawExecuted(period, pot, address(0));
-            return; // do NOT mark drawn
+            return; // do NOT mark drawn (audit C-1: a sub-minPot dust pot never consumes the period)
         }
         drawn[period] = true;
 

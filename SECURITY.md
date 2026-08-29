@@ -1,9 +1,17 @@
 # QPULL — Audit Remediation & Security Model
 
-This document responds to the external LeftClaw AI first-pass audit (repo `qpull-contracts`, commit
-`47d9c4f`). Every High/Medium/Low finding is mapped below to one of: **fixed in code**, **resolved by
-governance**, **accepted (bounded)**, **removed**, or **false positive**. The test suite is green after all
-code changes (`forge test`, local suites).
+This document tracks the external LeftClaw AI audits of `qpull-contracts` across three passes:
+
+- **Pass 1** (commit `47d9c4f`, 20H/24M/17L) — remediation in §§1–5.
+- **Pass 2 / job 737** (commit `6dd4dec`, 1C/8H/18M) — remediation in **§7**.
+- **H-2, the architecture change** (this revision) — the 4% transfer tax was structurally incompatible
+  with Uniswap-V4 flash accounting and has been **re-built as a V4 hook**; see **§8**. This revision also
+  passed an internal adversarial multi-agent review (§8) and adds the hook's test suite plus vendored
+  `v4-core` v4.0.0 to this repo so the hook can be verified against the real `PoolManager`.
+
+Every High/Medium/Low finding is mapped below to one of: **fixed in code**, **resolved by governance**,
+**accepted (bounded)**, **removed**, or **false positive**. The local test suite is green after all code
+changes (`forge test --no-match-path 'test/fork/*'`).
 
 ---
 
@@ -31,9 +39,11 @@ cryptographic review of the verifier remains recommended.
 **2. Value bridge — `Treasury.convert()` + the swap adapters.** *Invariant:* every unit of tax reaches the
 prize vaults or the team, less only real slippage; no path drains or bricks the flow. *Defenses:*
 keeper-gated `convert` with off-chain slippage floors; balance-delta accounting rather than trusting adapter
-return values; adapters callable only by the Treasury. *Please double-check:* the Uniswap-V4
-`unlock/settle/take` accounting, the residual sandwich surface within the keeper floor, and any way to strand
-or divert a batch.
+return values; adapters callable only by the Treasury. Tax now arrives in **two currencies** (QPULL on buys,
+WETH on exact-in sells — see §8); `convert()` swaps the QPULL leg and sweeps held WETH, taking the team's 20%
+of the combined WETH. *Please double-check:* the Uniswap-V4 `unlock/settle/take` accounting, the residual
+sandwich surface within the keeper floor, the min-batch-threshold vs. per-call-slice-cap interaction, and any
+way to strand or divert a batch.
 
 **3. Solvency — `BaseVault` + `ClaimManager`.** *Invariant:* `unclaimedReserve ≤ balance` at all times; each
 prize is paid at most once; reserved funds are never drainable. *Defenses:* reserve-against-free-balance;
@@ -41,11 +51,17 @@ pull-claims with a 30-day window; `payOut` refuses to touch the reserve; `nonRee
 double-check:* any path that lowers balance without a matching `release`, cross-vault reachability via an
 authorized engine, and ERC-404 whole-unit receipt / reentrancy on the payout leg.
 
-**4. Token hot path — `QPULLToken._update`.** *Invariant:* buys/sells are taxed and mint exactly the intended
-game entries; no untaxed route exists; no route can brick all transfers. *Defenses:* AMM-classified tax; a
-tax-exempt set limited to protocol contracts; the oracle guarded off the zero address. *Please double-check:*
-any exempt or router path that avoids tax or the registry fan-out, and any registry/oracle revert that would
-propagate to every transfer.
+**4. The tax hook — `QpullTaxHook` (the trade hot path).** As of H-2 (§8) the 4% tax is a **Uniswap-V4 hook**
+on the canonical QPULL/WETH pool, **not** a token transfer hook — `QPULLToken` is now a clean, ownerless
+ERC-20. *Invariant:* every canonical-pool trade pays exactly 4%, credits the intended game entries to the
+real swapper, and no trade can brick the pool; plain (non-trade) transfers are untaxed. *Defenses:* the hook
+is fully immutable (no owner/setters); the fee is taken inside the locked context via `take()`; attribution
+uses `tx.origin`; registry fan-out is `try/catch` so a reverting registry costs only that trade's rewards;
+`afterInitialize` restricts pool creation to the deployer's canonical pool. *Please double-check:* the
+`afterSwap` delta sign/currency for all four swap shapes, that `take(fee)` + the returned `+fee` delta always
+net to a settled unlock, the `exemptSender` (conversion) path, and any way to farm registry rewards or evade
+the fee. This surface received a dedicated internal adversarial review (§8) but a **human V4-hook specialist
+sign-off is still recommended before mainnet** — hooks are V4's most dangerous surface.
 
 The **accepted, bounded risks** are catalogued in §3 — we welcome disagreement with our reasoning there.
 
@@ -128,20 +144,100 @@ the DERP/committee halves of M-15/M-16) outright, since the affected code no lon
 
 ---
 
-## 6. Launch runbook — critical operator steps
+## 7. Second re-audit (LeftClaw job 737, commit `6dd4dec`) — 1C / 8H / 18M
 
-These steps are **required** and are not wired by `Deploy.s.sol` (the adapters and NFT are deployed
-separately):
+The stronger re-audit surfaced a Critical the first pass missed and re-opened several first-round fixes as
+incomplete. All confirmed and cheap-deploy findings are fixed (local suite green).
 
-1. **`adapter.setTreasury(<Treasury>)`** on BOTH swap adapters — else `convert()` fail-closes (reverts). *(H-1)*
-2. **`JackpotEngine.setPotCap(<cap>)`** and **`HolderDrawEngine.setPotCap`** / constructor cap — set concrete bounds. *(H-3B/M-9)*
-3. Create the QPULL/WETH V4 pool **hookless**, then `adapter.setPoolKey(...)`.
-4. After the NFT mint closes: **`finalizeLaunch()`** (seals rarity), then **`withdrawProceeds()`** (pays the buckets). *(H-13)*
-5. Transfer all ownership to the **Timelock + multisig**; renounce where no further changes are expected. *(§2)*
-6. Verify the keeper is posting drand beacons on-chain before the first draw window closes.
+| # | Severity | Finding | Change |
+|---|---|---|---|
+| **C-1** | Critical | **Dust-donation consumes a draw.** `freeBalance()` is donation-raisable and wei-scale guards let anyone trigger a draw for a few wei across all four engines (the Raffle variant also burned live tickets). | Owner-set **`minPot`** floor on Raffle/Jackpot/HolderDraw/Leaderboard: `pot < minPot` **voids without consuming** (no ticket burn, day/period not flagged). Leaderboard sets `distributed=true` only after `paid>0`; HolderDraw guard is `pot<minPot || pot/WINNERS==0`. **Must be set at launch** (default 0). |
+| **H-1** | High | My pass-1 H-12/H-13 fix **created a brick**: a mint before `setRecipients` locked proceeds + the reveal forever. | `mint()` now reverts unless recipients are set. |
+| **H-3** | High | `convert()` unbounded; a donation-inflated balance could brick the pipeline on one oversized swap. | **`maxConvertPerCall`** cap — the keeper drains in pool-sized slices. |
+| **H-4** | High | Holder-draw sybil: distinct-**wallet** selection rewards splitting NFTs across wallets. | `runDraw` selects **5 distinct tokenId slots** (swap-pop), payout linear in tokens held — splitting confers no advantage; one wallet can win multiple slots; voids only if `<5` eligible **tokens**. |
+| **H-5** | High | My pass-1 H-20 linear fix was **incomplete**: pro-rata over the capped 25-slot board is sybil-positive (splitting evicts incumbents, shrinks the denominator, captures 100%). | `LeaderboardRegistry` now tracks **`totalPoints[week]`** (all buyers); `distribute` divides by that, so off-board weight rolls forward and a split can never exceed its true share. |
+| **H-6 / L-11** | High/Low | `BlsDrandOracle` drand genesis/period unvalidated. | Constructor requires `genesis==1_692_803_367 && period==3`. |
+| **H-7** | High | `PackRegistry` / `NFTCollection` `revealDelay` unvalidated. | Require `>= 1 hour` (PackRegistry also `< 1 day`) — the reveal margin can't be set below the engines' `REVEAL_LAG`. |
+| **H-8** | High | Engine `genesis` vs. its registry's `genesis` uncross-checked. | Jackpot/Raffle constructors require `registry.genesis() == genesis_`. |
+| **M-1** | Med | Adapter settled the nominal `amountIn`, not the **consumed** delta → a partial fill reverts `convert()`. | Settle the consumed delta + refund the unconsumed remainder. |
+| **M-3** | Med | `RaffleEngine.MAX_K = 1000` (gas). | Lowered to 200. |
+| **M-8** | Med | `setPoolKey` re-settable / unvalidated. | Write-once + pair-checked (and, post-H-2, verifies the bound hook exempts the adapter — see §8). |
+| **M-13** | Med | `setNft` unchecked zero. | Zero-address check. |
+| **L-17** | Low | NFT split rounding dust went to team. | Dust rounds to LP; team is never `> 5%`. |
+
+**Owner-trust cluster** (M-2, M-6, M-10, M-11, M-18, L-5): resolved by the same governance model as §2.
+**False positives:** L-9 (`<5`-void already correct), L-10.
+
+The **immutable-controller** change (single one-shot `BaseVault.controller`, never revocable) closes the
+job-737 **M-14** and the residual halves of **H-10 / M-5** in code rather than by governance.
+
+---
+
+## 8. H-2 — the 4% tax re-built as a Uniswap-V4 hook
+
+**The finding.** A 4%-transfer-tax token is structurally incompatible with Uniswap V4's flash accounting:
+a token that skims transfers leaves a non-zero delta on `settle()` (`CurrencyNotSettled`), bricking every
+router that trades it; exempting a router to avoid that nullifies both the tax and the game entries. This
+gated launch and could not be patched at the token level.
+
+**The fix.** The tax is now a **trade tax collected by a hook** (`src/hooks/QpullTaxHook.sol`), and
+`QPULLToken` is a clean, **ownerless** ERC-20 (which independently closes the pass-2 owner-exemption **M-9**
+and setter **M-13**). Properties:
+
+- **Immutable** — no owner, no setters; the 4% and the first-hour gate are constants. A hook governs the
+  protocol's only liquid pool, so it deliberately holds **no admin lever**.
+- **`afterSwap`** takes 4% of the swap's *unspecified* currency (QPULL on buys, WETH on exact-in sells) via
+  `poolManager.take(feeCurrency, treasury, fee)` and returns it as a positive hook delta — v4-core makes the
+  swapper pay it (`Hooks.sol`: "the caller has to pay for the hook's delta"); the `take()` clears the hook's
+  own credit inside the same unlock. Verified against **vendored v4-core v4.0.0** for all four swap shapes.
+- **First-hour NFT-holder gate** enforced on buys, keyed to `tx.origin` (an unspoofable identity; `hookData`
+  is ignored as caller-supplied). Known, accepted limits: a holder using a **smart-contract wallet** is gated
+  during hour 1 (hold the NFT on the signing EOA, or wait for expiry); the gate window starts at
+  `initialize()`, so LP must be **seeded immediately after** (runbook §6).
+- **Game fan-out** to the three registries with `tx.origin`, wrapped in `try/catch` — an immutable hook must
+  never let a registry fault brick the pool (a failed record costs only that trade's rewards, `RecordFailed`).
+- **`afterInitialize`** restricts pool creation: only the deployer may create the canonical pool (no
+  front-run of the gate window) and no other pool may attach the hook (no reward-farm pools).
+- **Address flags** (`AFTER_INITIALIZE | AFTER_SWAP | AFTER_SWAP_RETURNS_DELTA = 0x1044`) are mined with a
+  CREATE2 salt (`script/HookMiner.sol`); `test/HookMiner.t.sol` proves the miner target and the constructor's
+  own `BadFlags` self-check agree (a launch-day revert if they ever drift).
+- The Treasury's `QpullWethAdapter` is the hook's **`exemptSender`** (conversion swaps pay no fee);
+  `setPoolKey` verifies that binding on-chain.
+
+**Internal adversarial review.** This revision was reviewed by a multi-agent pass across four lenses
+(V4 delta/settlement accounting, economic evasion, DoS/gate/pool-creation, cross-contract integration), each
+finding handed to an independent verifier to refute. **One finding survived, at LOW severity, and is fixed:**
+`Treasury.convert()` compared the min-batch `convertThreshold` against the already-capped per-call slice, so a
+misconfiguration where `maxConvertPerCall < convertThreshold` could strand the QPULL leg (owner-recoverable).
+Fixed: gate on the raw balance, then size the slice. No settlement, sign, fee-evasion, gate-bypass, or
+reentrancy issue survived verification.
+
+**Residual recommendation.** An internal review plus real-`PoolManager` tests is necessary, not sufficient:
+a **human V4-hook specialist sign-off remains recommended before mainnet.**
+
+---
+
+## 9. Launch runbook — critical operator steps
+
+Required steps not wired by `Deploy.s.sol`:
+
+1. **`Treasury.convert()` tax currency:** the QpullWethAdapter is the hook's `exemptSender`; `Deploy` wires
+   `setTreasury` + `setPoolKey` for it. Confirm the WETH→QUOTRON adapter's `setTreasury` too. *(H-1 pass-1)*
+2. **`setMinPot(<floor>)`** on **all four** engines (Raffle, Jackpot, HolderDraw, Leaderboard) and
+   **`Treasury.setMaxConvertPerCall(<pool-sized>)`** — both default to a permissive value and **must** be set
+   to concrete, pool-sized bounds at launch. *(C-1, H-3)*
+3. **`JackpotEngine.setPotCap`** / **`HolderDrawEngine`** constructor cap — concrete per-draw bounds. *(H-3B/M-9)*
+4. After the NFT mint closes: **`finalizeLaunch()`** (seals rarity), then **`withdrawProceeds()`**. *(H-13)*
+5. **GO-LIVE (H-2):** from the deployer key, `poolManager.initialize(canonicalPoolKey, sqrtPriceX96)` **then
+   seed LP immediately** (back-to-back, ideally one multicall/block). Initialize stamps `launchTime` and opens
+   the first-hour gate; a gap between initialize and LP silently shortens the effective gate.
+6. Transfer all ownership to the **Timelock + multisig**; renounce where no further changes are expected. The
+   tax hook has no owner, so nothing to transfer there. *(§2)*
+7. Verify the keeper is posting drand beacons on-chain before the first draw window closes.
 
 ---
 
 *This remediation was prepared with AI assistance and is not a substitute for an independent human security
-review. A dedicated cryptographic review of `BlsDrandOracle` and confirmation of QUOTRON's ERC-404 transfer
-semantics remain recommended before mainnet.*
+review. A dedicated cryptographic review of `BlsDrandOracle`, a **V4-hook specialist review of
+`QpullTaxHook`**, and confirmation of QUOTRON's ERC-404 transfer semantics remain recommended before
+mainnet.*

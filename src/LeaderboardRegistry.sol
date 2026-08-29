@@ -18,7 +18,7 @@ contract LeaderboardRegistry is ILeaderboardRegistry, Ownable2Step {
     uint256 internal constant WEEK = 7 days;
     uint256 public constant BOARD_SIZE = 25;
 
-    address public token; // QPULLToken — only caller of recordBuy
+    address public recorder; // QpullTaxHook — only caller of recordBuy
 
     struct Entry {
         address addr;
@@ -29,14 +29,17 @@ contract LeaderboardRegistry is ILeaderboardRegistry, Ownable2Step {
     mapping(uint256 => uint256) public boardCount; // week => filled slots (≤ 25)
     mapping(uint256 => mapping(address => uint256)) public points; // week => addr => points
     mapping(uint256 => mapping(address => uint256)) internal boardIndex; // week => addr => (slot+1); 0 = off-board
+    // Total points across ALL buyers this week (board and non-board). The payout divides by THIS, not by the
+    // 25-member board sum, so evicting a competitor can't shrink the denominator (audit H-5: sybil fix).
+    mapping(uint256 => uint256) public totalPoints;
 
-    event TokenSet(address token);
+    event RecorderSet(address recorder);
     event PointsAdded(uint256 indexed week, address indexed buyer, uint256 amount, uint256 total);
 
-    error NotToken();
+    error NotRecorder();
 
-    modifier onlyToken() {
-        if (msg.sender != token) revert NotToken();
+    modifier onlyRecorder() {
+        if (msg.sender != recorder) revert NotRecorder();
         _;
     }
 
@@ -44,15 +47,16 @@ contract LeaderboardRegistry is ILeaderboardRegistry, Ownable2Step {
         genesis = genesis_;
     }
 
-    function setToken(address t) external onlyOwner {
-        token = t;
-        emit TokenSet(t);
+    function setRecorder(address t) external onlyOwner {
+        recorder = t;
+        emit RecorderSet(t);
     }
 
     /// @inheritdoc ILeaderboardRegistry
-    function recordBuy(address buyer, uint256 grossValue) external override onlyToken {
+    function recordBuy(address buyer, uint256 grossValue) external override onlyRecorder {
         if (grossValue == 0) return;
         uint256 w = _week();
+        totalPoints[w] += grossValue; // audit H-5: all-buyer denominator
         uint256 p = points[w][buyer] + grossValue;
         points[w][buyer] = p;
         _updateBoard(w, buyer, p);

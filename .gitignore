@@ -1,8 +1,12 @@
-# Foundry
+# Foundry build artifacts
 out/
 cache/
-lib/
 broadcast/
+
+# Dependencies: OpenZeppelin + forge-std are installed via `forge install` (see README).
+# v4-core is VENDORED (committed under lib/v4-core) so the tax-hook tests compile as-is.
+lib/*
+!lib/v4-core
 
 # Secrets & local config
 .env

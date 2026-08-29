@@ -27,18 +27,36 @@ contract LeaderboardEngine is Ownable2Step {
     uint256 internal constant WEEK = 7 days;
     uint256 public constant CLAIM_WINDOW = 30 days;
 
+    uint256 public potCap = type(uint256).max; // audit M-7: bound a single week's payout; excess rolls forward
+    uint256 public minPot; // audit C-1: floor below which distribute voids WITHOUT consuming the week
     mapping(uint256 => bool) public distributed;
 
     event Distributed(uint256 indexed week, uint256 pot, uint256 winners);
+    event PotCapSet(uint256 potCap);
+    event MinPotSet(uint256 minPot);
 
     error AlreadyDistributed();
     error OutsideWindow();
+    error BadPotCap();
 
     constructor(address registry_, address vault_, address claim_, uint256 genesis_, address o) Ownable(o) {
         registry = LeaderboardRegistry(registry_);
         vault = IVault(vault_);
         claimManager = IClaimManager(claim_);
         genesis = genesis_;
+    }
+
+    /// @notice Bound a single week's payout (audit M-7). Excess over the cap rolls forward.
+    function setPotCap(uint256 c) external onlyOwner {
+        if (c == 0) revert BadPotCap();
+        potCap = c;
+        emit PotCapSet(c);
+    }
+
+    /// @notice Set the minimum pot below which distribute voids without consuming the week (audit C-1).
+    function setMinPot(uint256 m) external onlyOwner {
+        minPot = m;
+        emit MinPotSet(m);
     }
 
     function currentWeek() public view returns (uint256) {
@@ -54,23 +72,17 @@ contract LeaderboardEngine is Ownable2Step {
         // consumed (matches RaffleEngine/HolderDrawEngine — a funded retry can still pay within the window).
         uint256 cnt = registry.boardCount(week);
         uint256 pot = vault.freeBalance();
-        if (cnt == 0 || pot == 0) {
+        if (pot > potCap) pot = potCap; // audit M-7: bound the single-week payout; excess rolls forward
+        // audit H-5: divide by ALL buyers' points this week, NOT the 25-member board sum — otherwise splitting
+        // a stake across 25 wallets that evict every incumbent shrinks the denominator to the attacker's own
+        // wallets and captures 100% of the pot. Non-board buyers' weight simply stays in the vault and rolls
+        // forward. So the top-25 collectively receive (their points / all points) of the pot.
+        uint256 totalW = registry.totalPoints(week);
+        if (cnt == 0 || pot == 0 || pot < minPot || totalW == 0) {
             emit Distributed(week, pot, 0);
-            return; // do NOT mark distributed
+            return; // do NOT mark distributed (audit C-1: a sub-minPot dust pot never consumes the week)
         }
 
-        // Total points across the board - linear / pro-rata, sybil-neutral (audit H-20).
-        uint256 totalW;
-        for (uint256 i; i < cnt; ++i) {
-            (, uint256 p) = registry.boardAt(week, i);
-            totalW += p;
-        }
-        if (totalW == 0) {
-            emit Distributed(week, pot, 0);
-            return; // do NOT mark distributed
-        }
-
-        distributed[week] = true; // audit H-2: flag only once a real payout is committed
         uint64 deadline = uint64(block.timestamp + CLAIM_WINDOW);
         uint256 paid;
         for (uint256 i; i < cnt; ++i) {
@@ -82,6 +94,11 @@ contract LeaderboardEngine is Ownable2Step {
                 ++paid;
             }
         }
+        if (paid == 0) {
+            emit Distributed(week, pot, 0);
+            return; // audit C-1: do NOT consume the week if every share floored to zero
+        }
+        distributed[week] = true; // audit C-1: flag only AFTER >=1 nonzero claim is registered
         emit Distributed(week, pot, paid);
     }
 }

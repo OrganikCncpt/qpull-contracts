@@ -13,30 +13,35 @@ import { IVault } from "./interfaces/IVault.sol";
 ///         the instruction of an authorized controller (an engine or the claim manager).
 ///         Tracks `unclaimedReserve` so `freeBalance` never counts prizes already owed (spec §8) —
 ///         the invariant that makes a pot structurally impossible to over-state.
-/// @dev    Reserved (already-owed) prizes are protected UNCONDITIONALLY: payOut reverts if it would dip
-///         into `unclaimedReserve`, so no controller — rogue or not — can pay out funds a winner has already
-///         claimed (audit H-8). The one owner power (authorizing controllers) can therefore reach at most
-///         genuinely FREE balance; keep controller-management behind a timelock/multisig and renounce after
-///         launch to close even that. (This supersedes the earlier "no owner-drain path" claim, which the
-///         audit correctly flagged as false.)
+/// @dev    payOut reverts if it would dip into `unclaimedReserve`, so the HONEST controller (ClaimManager,
+///         which pairs one release with one payOut per claim) can never pay out funds already owed to a
+///         winner. This protection is NOT unconditional (audit M-5): `release` takes a bare amount with no
+///         claim binding, so a MALICIOUS controller could call release(unclaimedReserve) then payOut(...) to
+///         drain owed funds. The sole controller (ClaimManager) is bound ONCE and is then immutable (audit
+///         M-14/H-10/M-5): the owner can neither revoke it nor add a second, malicious controller, so this
+///         reduces to trusting ClaimManager's own release/payOut pairing — which it does one-for-one per claim.
 contract BaseVault is IVault, IERC721Receiver, Ownable2Step {
     using SafeERC20 for IERC20;
 
     IERC20 public immutable quotron;
-    mapping(address => bool) public isController; // engine(s) + claim manager
+    // The SINGLE controller (ClaimManager). Set ONCE, then immutable — never a second controller, never
+    // revoked (audit M-14/H-10): the owner can neither lock prizes by de-authorizing nor add a malicious
+    // controller, and the ">30-day interruption forfeits claims" scenario cannot arise.
+    address public controller;
     uint256 public override unclaimedReserve;
 
-    event ControllerSet(address indexed controller, bool authorized);
+    event ControllerSet(address indexed controller);
     event PaidOut(address indexed to, uint256 amount);
     event Reserved(uint256 amount, uint256 totalReserve);
     event Released(uint256 amount, uint256 totalReserve);
 
     error NotController();
+    error ControllerAlreadySet();
     error ReserveUnderflow();
     error InsufficientFree();
 
     modifier onlyController() {
-        if (!isController[msg.sender]) revert NotController();
+        if (msg.sender != controller) revert NotController();
         _;
     }
 
@@ -44,9 +49,13 @@ contract BaseVault is IVault, IERC721Receiver, Ownable2Step {
         quotron = IERC20(quotron_);
     }
 
-    function setController(address c, bool authorized) external onlyOwner {
-        isController[c] = authorized;
-        emit ControllerSet(c, authorized);
+    /// @notice Bind the single controller (ClaimManager) ONCE — it can never be changed or revoked after
+    ///         (audit M-14/H-10). Keep behind the timelock and set correctly at launch.
+    function setController(address c) external onlyOwner {
+        if (controller != address(0)) revert ControllerAlreadySet();
+        if (c == address(0)) revert NotController();
+        controller = c;
+        emit ControllerSet(c);
     }
 
     /// @inheritdoc IVault

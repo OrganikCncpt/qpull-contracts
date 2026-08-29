@@ -42,7 +42,7 @@ contract PackRegistry is IPackRegistry, Ownable2Step {
     uint64 public lastTicketAdjust; // last re-peg timestamp (0 = never)
 
     // ─── wiring ──────────────────────────────────────────────────────────────
-    address public token; // QPULLToken — only caller of recordBuy
+    address public recorder; // QpullTaxHook — only caller of recordBuy
     address public engine; // RaffleEngine — only caller of drawFrom
     // Gas bound on per-buy minting. At ~73k gas/pack a cap of 1000 needed ~73M gas — above the L2 block
     // limit, so an ordinary large buy reverted (audit H-18). 100 keeps a full-cap buy well within a block;
@@ -72,7 +72,7 @@ contract PackRegistry is IPackRegistry, Ownable2Step {
     mapping(uint256 => mapping(uint32 => bool)) public freeClaimed; // nft tokenId => day => claimed
 
     // ─── events / errors ─────────────────────────────────────────────────────
-    event TokenSet(address token);
+    event RecorderSet(address recorder);
     event EngineSet(address engine);
     event NftSet(address nft);
     event PackMinted(uint256 indexed id, address indexed owner, uint32 cohortDay, uint64 revealRound);
@@ -81,7 +81,7 @@ contract PackRegistry is IPackRegistry, Ownable2Step {
     event TicketPriceSet(uint256 oldPrice, uint256 newPrice);
     event MaxTicketsPerBuySet(uint256 m);
 
-    error NotToken();
+    error NotRecorder();
     error NotEngine();
     error NotStarted();
     error NoNft();
@@ -91,9 +91,10 @@ contract PackRegistry is IPackRegistry, Ownable2Step {
     error AdjustOutOfBounds();
     error ZeroDrand();
     error BadMaxTickets();
+    error BadRevealDelay();
 
-    modifier onlyToken() {
-        if (msg.sender != token) revert NotToken();
+    modifier onlyRecorder() {
+        if (msg.sender != recorder) revert NotRecorder();
         _;
     }
 
@@ -111,15 +112,18 @@ contract PackRegistry is IPackRegistry, Ownable2Step {
     ) Ownable(initialOwner) {
         if (ticketPrice_ == 0) revert TicketPriceZero();
         if (drand_ == address(0)) revert ZeroDrand(); // audit M-17: oracle sits on the taxed-buy hot path
+        // audit H-7: seal margin must be >= the engines' REVEAL_LAG (1h) so a cohort's tier round isn't
+        // near-public before the buy window closes, and < 1 day so it reveals within the cohort's draw window.
+        if (revealDelay_ < 1 hours || revealDelay_ >= 1 days) revert BadRevealDelay();
         drand = IDrandOracle(drand_);
         ticketPrice = ticketPrice_;
         genesis = genesis_;
         revealDelay = revealDelay_;
     }
 
-    function setToken(address t) external onlyOwner {
-        token = t;
-        emit TokenSet(t);
+    function setRecorder(address t) external onlyOwner {
+        recorder = t;
+        emit RecorderSet(t);
     }
 
     function setEngine(address e) external onlyOwner {
@@ -158,7 +162,7 @@ contract PackRegistry is IPackRegistry, Ownable2Step {
     // ─── minting (buys only) ─────────────────────────────────────────────────
 
     /// @inheritdoc IPackRegistry
-    function recordBuy(address buyer, uint256 grossValue) external override onlyToken {
+    function recordBuy(address buyer, uint256 grossValue) external override onlyRecorder {
         uint256 avail = bankedRemainder[buyer] + grossValue;
         uint256 n = avail / ticketPrice;
         if (n > maxTicketsPerBuy) n = maxTicketsPerBuy; // cap gas; the excess value stays banked for later buys

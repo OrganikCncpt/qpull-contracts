@@ -22,8 +22,16 @@ import {
 ///         "Canonical ETH router", which is hard-wired to the QUOTRON pool and hook-gated. The QPULL/WETH
 ///         pool is created at launch; its `PoolKey` (sorted currencies, fee, tickSpacing, hook) is set
 ///         once via `setPoolKey`. `minOut` is the off-chain slippage floor — enforced here after the swap.
-/// @dev    Launch the QPULL pool with a permissive/absent hook so this direct-core swap is allowed. The
+/// @dev    The canonical pool carries QpullTaxHook (audit H-2); this adapter is that hook's exemptSender,
+///         so its conversion swaps pay no protocol fee. setPoolKey verifies that binding on-chain. The
 ///         PoolManager address is immutable; the PoolKey is the only launch-time binding (data, not code).
+interface ITaxHook {
+    function exemptSender() external view returns (address);
+    function poolManager() external view returns (address);
+    function canonicalFee() external view returns (uint24);
+    function canonicalTickSpacing() external view returns (int24);
+}
+
 contract QpullWethAdapter is ISwapAdapter, IUnlockCallback, Ownable2Step, ReentrancyGuard {
     using SafeERC20 for IERC20;
     using BalanceDeltaLib for BalanceDelta;
@@ -50,6 +58,8 @@ contract QpullWethAdapter is ISwapAdapter, IUnlockCallback, Ownable2Step, Reentr
     error NotPoolManager();
     error Slippage();
     error NotTreasury();
+    error BadPoolKey();
+    error PoolKeyAlreadySet();
 
     constructor(address poolManager_, address qpull_, address weth_, address initialOwner)
         Ownable(initialOwner)
@@ -61,12 +71,26 @@ contract QpullWethAdapter is ISwapAdapter, IUnlockCallback, Ownable2Step, Reentr
 
     /// @notice Bind the QPULL/WETH pool once it exists at launch. currency0/currency1 must be the
     ///         address-sorted (QPULL, WETH) pair, exactly as the pool was initialized.
+    /// @dev    The canonical pool now carries QpullTaxHook (audit H-2 — the 4% tax IS the hook), so the
+    ///         M-8 "hookless only" rule is replaced by a stronger, self-referential proof: the bound
+    ///         hook must run on the same PoolManager, serve exactly this pair at this fee/tickSpacing
+    ///         (its own canonical check), and name THIS adapter as its fee-exempt sender — i.e. the one
+    ///         hook that provably cannot skim this adapter's swaps. Still owner-gated and write-once.
     function setPoolKey(PoolKey calldata k) external onlyOwner {
+        if (poolKeySet) revert PoolKeyAlreadySet(); // audit M-8: write-once
+        address c0 = Currency.unwrap(k.currency0);
+        address c1 = Currency.unwrap(k.currency1);
+        (address lo, address hi) = qpull < weth ? (qpull, weth) : (weth, qpull);
+        if (c0 != lo || c1 != hi) revert BadPoolKey(); // audit M-8: must be the address-sorted QPULL/WETH pair
+        if (k.hooks == address(0)) revert BadPoolKey(); // the canonical pool is hooked by construction
+        ITaxHook h = ITaxHook(k.hooks);
+        if (
+            h.exemptSender() != address(this) || address(h.poolManager()) != address(poolManager)
+                || h.canonicalFee() != k.fee || h.canonicalTickSpacing() != k.tickSpacing
+        ) revert BadPoolKey();
         poolKey = k;
         poolKeySet = true;
-        emit PoolKeySet(
-            Currency.unwrap(k.currency0), Currency.unwrap(k.currency1), k.fee, k.tickSpacing, k.hooks
-        );
+        emit PoolKeySet(c0, c1, k.fee, k.tickSpacing, k.hooks);
     }
 
     /// @notice Authorize the Treasury as the sole caller of swapExactIn. This adapter MUST be tax-exempt on
@@ -111,10 +135,19 @@ contract QpullWethAdapter is ISwapAdapter, IUnlockCallback, Ownable2Step, Reentr
             ""
         );
 
-        // Pay QPULL in: sync, transfer, settle.
+        // audit M-1: settle exactly what V4 CONSUMED (the negative input side of the delta), not the nominal
+        // amountIn. On a partial fill (pool liquidity exhausted at the price-limit sentinel) V4 takes less than
+        // amountIn; settling the nominal would leave a positive delta and revert unlock() with CurrencyNotSettled.
+        int128 in128 = zeroForOne ? delta.amount0() : delta.amount1(); // negative = QPULL owed to the pool
+        uint256 consumed = uint256(uint128(-in128));
+
+        // Pay QPULL in: sync, transfer the consumed amount, settle.
         poolManager.sync(Currency.wrap(qpull));
-        IERC20(qpull).safeTransfer(address(poolManager), amountIn);
+        IERC20(qpull).safeTransfer(address(poolManager), consumed);
         poolManager.settle();
+
+        // Refund any unconsumed QPULL back to the caller (the Treasury) so none is stranded in the adapter.
+        if (amountIn > consumed) IERC20(qpull).safeTransfer(to, amountIn - consumed);
 
         // Take WETH out (the positive side of the delta).
         int128 out128 = zeroForOne ? delta.amount1() : delta.amount0();
