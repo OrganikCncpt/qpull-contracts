@@ -7,6 +7,50 @@ code changes (`forge test`, local suites).
 
 ---
 
+## Security model & reviewer guidance
+
+Two standing assumptions to adopt when reviewing:
+
+- **Owner = `TimelockController` (delay ≥ 48h) + multisig**, with ownership renounced where possible after
+  launch (see §2). No privileged setter is instant.
+- **QUOTRON is an external ERC-404** whose exact whole-unit / receiver-hook semantics **cannot be verified
+  from this repo**. Treat its behavior as adversarial wherever the protocol relies on it, and flag any
+  assumption rather than skipping it.
+
+The whole tree is in scope, but these four surfaces carry the largest blast radius — a defect here is
+catastrophic rather than bounded, so they warrant the deepest attention:
+
+**1. Randomness — the fairness root.** *Invariant:* no draw or reveal beacon is knowable or forgeable before
+its cutoff. *Defenses:* trustless on-chain BLS verification of drand quicknet (`BlsDrandOracle`);
+future-bound reveal rounds with a `REVEAL_LAG` buffer; `roundAt` returns the first round at/after a cutoff
+(ceil). *Please double-check:* (a) can the BLS verifier accept an invalid signature? — one false-accept makes
+every outcome forgeable; (b) is any consumer's reveal round knowable before its entry/snapshot window closes
+(`RaffleEngine`, `JackpotEngine`, `HolderDrawEngine`, `PackRegistry`, `NFTCollection`)? A dedicated
+cryptographic review of the verifier remains recommended.
+
+**2. Value bridge — `Treasury.convert()` + the swap adapters.** *Invariant:* every unit of tax reaches the
+prize vaults or the team, less only real slippage; no path drains or bricks the flow. *Defenses:*
+keeper-gated `convert` with off-chain slippage floors; balance-delta accounting rather than trusting adapter
+return values; adapters callable only by the Treasury. *Please double-check:* the Uniswap-V4
+`unlock/settle/take` accounting, the residual sandwich surface within the keeper floor, and any way to strand
+or divert a batch.
+
+**3. Solvency — `BaseVault` + `ClaimManager`.** *Invariant:* `unclaimedReserve ≤ balance` at all times; each
+prize is paid at most once; reserved funds are never drainable. *Defenses:* reserve-against-free-balance;
+pull-claims with a 30-day window; `payOut` refuses to touch the reserve; `nonReentrant` + CEI. *Please
+double-check:* any path that lowers balance without a matching `release`, cross-vault reachability via an
+authorized engine, and ERC-404 whole-unit receipt / reentrancy on the payout leg.
+
+**4. Token hot path — `QPULLToken._update`.** *Invariant:* buys/sells are taxed and mint exactly the intended
+game entries; no untaxed route exists; no route can brick all transfers. *Defenses:* AMM-classified tax; a
+tax-exempt set limited to protocol contracts; the oracle guarded off the zero address. *Please double-check:*
+any exempt or router path that avoids tax or the registry fan-out, and any registry/oracle revert that would
+propagate to every transfer.
+
+The **accepted, bounded risks** are catalogued in §3 — we welcome disagreement with our reasoning there.
+
+---
+
 ## 1. Fixed in code
 
 | # | Finding | Change |
