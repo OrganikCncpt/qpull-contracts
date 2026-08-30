@@ -20,7 +20,6 @@ import { IDrandOracle } from "../interfaces/IDrandOracle.sol";
 ///         dedicated cryptographic review before mainnet.
 contract BlsDrandOracle is IDrandOracle {
     // precompiles
-    address internal constant SHA256 = address(0x02);
     address internal constant MODEXP = address(0x05);
     address internal constant BLS_G1ADD = address(0x0b);
     address internal constant BLS_PAIRING = address(0x0f);

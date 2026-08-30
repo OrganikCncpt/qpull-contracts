@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: MIT
 pragma solidity 0.8.26;
 
+import { ReentrancyGuardTransient } from "@openzeppelin/contracts/utils/ReentrancyGuardTransient.sol";
 import {
     IPoolManager,
     PoolKey,
@@ -47,6 +48,11 @@ import { INFTCollection } from "../interfaces/INFTCollection.sol";
 ///           - registry notification is try/catch: this hook is immutable, so a reverting registry
 ///             must only ever cost that trade's rewards (RecordFailed event), never brick the pool.
 ///             The fee take() and the gate are NOT try/caught — fee delivery and the gate fail closed.
+///           - afterSwap is `nonReentrant` (transient guard). Reentrancy is already prevented by the
+///             PoolManager's unlock-lock, onlyPoolManager, and trusted storage-only registries, and the
+///             hook has NO mutable per-swap state to corrupt — so this is belt-and-braces (a Certora
+///             hook-checklist item). It does NOT block multi-hop routing (sequential afterSwap calls,
+///             not nested); it only bars a true nested re-entry, which cannot happen anyway.
 ///
 ///         V4 mechanics (verified against vendored v4-core v4.0.0):
 ///           - address flag bits: AFTER_INITIALIZE (1<<12) | AFTER_SWAP (1<<6) |
@@ -62,7 +68,7 @@ import { INFTCollection } from "../interfaces/INFTCollection.sol";
 ///             launch, stamping launchTime early and burning the first-hour gate), and no other
 ///             PoolKey may attach this hook at all (otherwise a QPULL/junk pool could farm registry
 ///             rewards through afterSwap).
-contract QpullTaxHook {
+contract QpullTaxHook is ReentrancyGuardTransient {
     using BalanceDeltaLib for BalanceDelta;
 
     // ─── constants ───────────────────────────────────────────────────────────
@@ -188,7 +194,7 @@ contract QpullTaxHook {
         IPoolManager.SwapParams calldata params,
         BalanceDelta delta,
         bytes calldata // hookData: deliberately IGNORED — caller-supplied, cannot be trusted for identity
-    ) external onlyPoolManager returns (bytes4, int128) {
+    ) external onlyPoolManager nonReentrant returns (bytes4, int128) {
         if (!isCanonical(key)) revert NotCanonicalPool(); // unreachable (afterInitialize), defense-in-depth
 
         // The protocol's own conversion path (Treasury -> QpullWethAdapter -> this pool) is exempt:
