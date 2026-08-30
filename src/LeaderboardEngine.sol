@@ -39,9 +39,20 @@ contract LeaderboardEngine is Ownable2Step, ReentrancyGuard {
     error AlreadyDistributed();
     error OutsideWindow();
     error BadPotCap();
+    error BadMinPot(); // audit F5
     error GenesisMismatch();
 
-    constructor(address registry_, address vault_, address claim_, uint256 genesis_, address o) Ownable(o) {
+    constructor(
+        address registry_,
+        address vault_,
+        address claim_,
+        uint256 genesis_,
+        uint256 minPot_,
+        address o
+    ) Ownable(o) {
+        // audit F5: minPot REQUIRED (> 0) — the config-independent guard only floors at ~5-20 wei, so a 0
+        // default let a dust donation consume a whole week's top-25 payout. Fail-closed on-chain now.
+        if (minPot_ == 0) revert BadMinPot();
         registry = LeaderboardRegistry(registry_);
         vault = IVault(vault_);
         claimManager = IClaimManager(claim_);
@@ -49,6 +60,7 @@ contract LeaderboardEngine is Ownable2Step, ReentrancyGuard {
         // a divergence would desync the distribute() window from the registry's accrual-week numbering.
         if (LeaderboardRegistry(registry_).genesis() != genesis_) revert GenesisMismatch();
         genesis = genesis_;
+        minPot = minPot_;
     }
 
     /// @notice Bound a single week's payout (audit M-7). Never below the minPot floor (audit L-3).
@@ -61,7 +73,7 @@ contract LeaderboardEngine is Ownable2Step, ReentrancyGuard {
     /// @notice Set the minimum pot below which distribute voids without consuming the week (audit C-1).
     ///         Cross-checked against potCap (audit L-3): minPot > potCap would silently void every week.
     function setMinPot(uint256 m) external onlyOwner {
-        if (m > potCap) revert BadPotCap();
+        if (m == 0 || m > potCap) revert BadMinPot(); // audit F5: never 0, never above potCap
         minPot = m;
         emit MinPotSet(m);
     }

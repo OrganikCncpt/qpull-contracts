@@ -157,7 +157,12 @@ contract Treasury is Ownable2Step, ReentrancyGuard, IERC721Receiver {
         // the already-capped slice would let any config with maxConvertPerCall < convertThreshold strand
         // the QPULL leg forever (H-2 review, hardened): the slice can never reach the threshold, so the
         // QPULL→WETH conversion never runs even with a huge balance.
-        bool qpullLeg = qpullBal > 0 && qpullBal >= convertThreshold;
+        // audit F10: also skip the QPULL leg when a full WETH slice is already backed up (wethHeld >=
+        // maxWethConvertPerCall). The QPULL leg's WETH OUTPUT is bounded only by the deep QPULL/WETH pool,
+        // not by maxWethConvertPerCall (which is sized for the shallow QUOTRON pool), so without this a
+        // single call's QPULL→WETH output can exceed the WETH cap and the unprocessed WETH grows every
+        // call instead of draining. Draining the WETH backlog first keeps the two legs from diverging.
+        bool qpullLeg = qpullBal > 0 && qpullBal >= convertThreshold && wethHeld < maxWethConvertPerCall;
         uint256 qpullIn = qpullBal > maxConvertPerCall ? maxConvertPerCall : qpullBal; // pool-sized slice
         // Sub-threshold QPULL waits for more tax; a WETH-only sweep is always allowed (threshold is an
         // anti-dust backstop for the QPULL swap leg, and convert() is keeper-gated anyway).

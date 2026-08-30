@@ -32,6 +32,7 @@ contract JackpotRegistry is IJackpotRegistry, Ownable2Step {
     event Entry(uint256 indexed period, address indexed trader, uint256 amount, uint256 periodTotal);
 
     error NotRecorder();
+    error AlreadySet(); // audit F14: recorder is write-once
 
     modifier onlyRecorder() {
         if (msg.sender != recorder) revert NotRecorder();
@@ -42,7 +43,9 @@ contract JackpotRegistry is IJackpotRegistry, Ownable2Step {
         genesis = genesis_;
     }
 
+    // audit F14: write-once — a re-settable recorder let a compromised owner forge jackpot entries.
     function setRecorder(address t) external onlyOwner {
+        if (t == address(0) || recorder != address(0)) revert AlreadySet();
         recorder = t;
         emit RecorderSet(t);
     }

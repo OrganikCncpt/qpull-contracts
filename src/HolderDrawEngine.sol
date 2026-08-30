@@ -80,7 +80,6 @@ contract HolderDrawEngine is Ownable2Step, ReentrancyGuard {
     error AdjustTooSoon();
     error AdjustOutOfBounds();
     error SnapshotClosed();
-    error SnapshotInProgress();
     error AlreadyDrawn();
     error OutsideWindow();
     error BadMinPot();
@@ -140,7 +139,15 @@ contract HolderDrawEngine is Ownable2Step, ReentrancyGuard {
     /// @notice Freeze ownerOf over tokenIds 1..SUPPLY for the CURRENT week, chunked by `maxCount`. Unminted
     ///         ids are captured as address(0) via try/catch so a partial sellout can never brick the game.
     ///         Set-once per week: once the buffer is complete it is frozen until the week rolls over.
-    function snapshot(uint256 maxCount) external {
+    /// @notice Freeze ownerOf over ALL tokenIds 1..SUPPLY for the current week in ONE transaction.
+    /// @dev    ATOMIC by design (audit F3). A chunked snapshot with a persisted cursor let whoever advanced
+    ///         the cursor choose each token's freeze instant independently — so an attacker could buy a
+    ///         tokenId, `snapshot` past it to freeze itself as that token's owner, then sell, serially,
+    ///         capturing draw slots with transient (buy→snapshot→sell) capital instead of sustained holding
+    ///         (a ~250x capital reduction) and letting a seller freeze a buyer out of the draw. Freezing
+    ///         every token at a single block instead means eligibility requires actually holding the NFTs at
+    ///         that one instant. ~250 ownerOf reads + writes fit comfortably in one L2 block.
+    function snapshot() external {
         uint256 week = currentPeriod();
         // Only in the last SNAP_WINDOW of the week. The currentPeriod gate closes writes at snapDeadline(week),
         // and the settling beacon does not publish until snapDeadline(week)+REVEAL_LAG — so no snapshot write
@@ -148,27 +155,26 @@ contract HolderDrawEngine is Ownable2Step, ReentrancyGuard {
         if (block.timestamp < snapDeadline(week) - SNAP_WINDOW) revert SnapshotClosed();
 
         uint256 buf = week & 1;
-        if (snapEpochOf[buf] != week + 1) {
-            // New epoch on this parity buffer — reset the cursor (values are overwritten as we go).
-            snapEpochOf[buf] = week + 1;
-            snapCursorOf[buf] = 0;
-        }
-        uint256 cursor = snapCursorOf[buf];
-        if (cursor >= SUPPLY) revert SnapshotClosed(); // already complete — frozen
+        if (snapEpochOf[buf] == week + 1 && snapCursorOf[buf] == SUPPLY) revert SnapshotClosed(); // set-once
+        snapEpochOf[buf] = week + 1;
 
-        uint256 end = cursor + maxCount;
-        if (end > SUPPLY) end = SUPPLY;
-        for (uint256 tid = cursor + 1; tid <= end; ++tid) {
+        for (uint256 tid = 1; tid <= SUPPLY; ++tid) {
             try nft.ownerOf(tid) returns (address o) {
-                // Freeze exclusion at snapshot time (audit H-7): an excluded owner is captured as address(0),
-                // so a post-snapshot setExcluded cannot re-roll this week's winners after the beacon is near.
+                // Freeze exclusion at snapshot time (audit H-7): an excluded owner is captured as address(0).
                 snapOwner[buf][tid] = excluded[o] ? address(0) : o;
             } catch {
                 snapOwner[buf][tid] = address(0);
             }
         }
-        snapCursorOf[buf] = uint16(end);
-        emit Snapshotted(week, end);
+        snapCursorOf[buf] = uint16(SUPPLY);
+        emit Snapshotted(week, SUPPLY);
+    }
+
+    /// @notice The frozen snapshot owner of `tokenId` for `week` (0 = not eligible / not yet snapshotted).
+    ///         A public getter (audit F3) so a prospective NFT buyer can check whether a token is already
+    ///         frozen out of the current week's draw before purchasing.
+    function snapshotOwnerOf(uint256 week, uint256 tokenId) external view returns (address) {
+        return snapOwner[week & 1][tokenId];
     }
 
     // ─── draw (following week only; void-on-miss) ────────────────────────────
@@ -264,12 +270,10 @@ contract HolderDrawEngine is Ownable2Step, ReentrancyGuard {
     ///         partway done (audit M-4): exclusion is frozen per-token as each chunk runs, so a mid-snapshot
     ///         change would freeze an internally-inconsistent owner set (some of the account's tokens captured
     ///         as owner, others as address(0)). Change it before the snapshot starts or after it completes.
+    /// @notice Bar an address (protocol/escrow) from winning. Exclusion is read atomically inside the
+    ///         single-tx snapshot (audit F3), so it can no longer be applied inconsistently mid-scan — the
+    ///         old mid-snapshot guard (and its griefing vector) are gone with the chunked snapshot.
     function setExcluded(address account, bool v) external onlyOwner {
-        uint256 week = currentPeriod();
-        uint256 buf = week & 1;
-        if (snapEpochOf[buf] == week + 1 && snapCursorOf[buf] > 0 && snapCursorOf[buf] < SUPPLY) {
-            revert SnapshotInProgress();
-        }
         excluded[account] = v;
         emit ExcludedSet(account, v);
     }

@@ -92,6 +92,7 @@ contract PackRegistry is IPackRegistry, Ownable2Step {
     error ZeroDrand();
     error BadMaxTickets();
     error BadRevealDelay();
+    error AlreadySet(); // audit F14/F15: reward-gating bindings are write-once
 
     modifier onlyRecorder() {
         if (msg.sender != recorder) revert NotRecorder();
@@ -121,17 +122,26 @@ contract PackRegistry is IPackRegistry, Ownable2Step {
         revealDelay = revealDelay_;
     }
 
+    // audit F14: write-once. The recorder gates recordBuy (mints tickets + points); a re-settable
+    // recorder let a compromised owner point it at an EOA, forge unlimited entries, then restore it.
     function setRecorder(address t) external onlyOwner {
+        if (t == address(0) || recorder != address(0)) revert AlreadySet();
         recorder = t;
         emit RecorderSet(t);
     }
 
+    // audit F15: write-once. drawFrom is onlyEngine; a re-settable engine let a compromised owner
+    // register a malicious engine and pop every live ticket. (drawFrom also clamps k internally now.)
     function setEngine(address e) external onlyOwner {
+        if (e == address(0) || engine != address(0)) revert AlreadySet();
         engine = e;
         emit EngineSet(e);
     }
 
+    // audit F15-lead: write-once. A re-settable nft let a compromised owner substitute a fake NFT to
+    // farm free entries; freezing it closes that lever.
     function setNft(address n) external onlyOwner {
+        if (n == address(0) || address(nft) != address(0)) revert AlreadySet();
         nft = INFTCollection(n);
         emit NftSet(n);
     }
@@ -237,6 +247,10 @@ contract PackRegistry is IPackRegistry, Ownable2Step {
         returns (uint256[] memory winners)
     {
         if (drawDay == 0) revert NotStarted();
+        // audit F15: clamp k HERE, independent of the caller — so even a mis-wired/hostile engine can
+        // never pop more than the ceiling of live tickets per call (RaffleEngine's MAX_K == this, so
+        // honest draws are unaffected). This is defense-in-depth atop the now-write-once engine binding.
+        if (k > MAX_TICKETS_CEILING) k = MAX_TICKETS_CEILING;
         uint32 from = drawDay > LIFE_DAYS ? drawDay - LIFE_DAYS : 0;
         uint32 to = drawDay - 1;
 

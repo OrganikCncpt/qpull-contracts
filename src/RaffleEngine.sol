@@ -68,6 +68,7 @@ contract RaffleEngine is Ownable2Step, ReentrancyGuard {
     error BadK();
     error GenesisMismatch();
     error BadPotCap();
+    error BadMinPot(); // audit F5
 
     constructor(
         address drand_,
@@ -76,8 +77,13 @@ contract RaffleEngine is Ownable2Step, ReentrancyGuard {
         address claim_,
         uint256 genesis_,
         uint256 k_,
+        uint256 minPot_,
         address initialOwner
     ) Ownable(initialOwner) {
+        // audit F5: minPot is REQUIRED (> 0) at construction. The config-independent guard only floors at
+        // ~10*winnersPerDay wei — far too low — so a 0 default let a dust donation consume a day AND burn
+        // real purchased tickets. Now fail-closed on-chain like Jackpot/HolderDraw.
+        if (minPot_ == 0) revert BadMinPot();
         drand = IDrandOracle(drand_);
         packs = PackRegistry(packs_);
         vault = IVault(vault_);
@@ -86,6 +92,7 @@ contract RaffleEngine is Ownable2Step, ReentrancyGuard {
         genesis = genesis_;
         if (k_ == 0 || k_ > MAX_K) revert BadK();
         winnersPerDay = k_;
+        minPot = minPot_;
     }
 
     function setWinnersPerDay(uint256 k) external onlyOwner {
@@ -97,7 +104,7 @@ contract RaffleEngine is Ownable2Step, ReentrancyGuard {
     /// @notice Set the minimum pot below which a draw voids without consuming the day (audit C-1).
     ///         Cross-checked against potCap (audit L-3): minPot > potCap would silently void every draw.
     function setMinPot(uint256 m) external onlyOwner {
-        if (m > potCap) revert BadPotCap();
+        if (m == 0 || m > potCap) revert BadMinPot(); // audit F5: never 0, never above potCap
         minPot = m;
         emit MinPotSet(m);
     }
@@ -150,14 +157,16 @@ contract RaffleEngine is Ownable2Step, ReentrancyGuard {
         }
 
         bytes32 beacon = drand.randomness(drawRound(day)); // reverts if beacon missing (retry within window)
-        drawn[day] = true;
 
         uint256[] memory winners = packs.drawFrom(beacon, day, winnersPerDay);
         uint256 n = winners.length;
         if (n == 0) {
+            // audit F16: an empty ticket window pops nothing — do NOT consume the day (matches the sibling
+            // engines' zero-outcome branches), so a later retry within the window can still draw.
             emit DrawExecuted(day, pot, 0);
             return;
         }
+        drawn[day] = true;
 
         // Pass 1: resolve tiers and count winners per tier.
         uint8[] memory tiers = new uint8[](n);
