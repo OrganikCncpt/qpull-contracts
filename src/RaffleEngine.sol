@@ -2,8 +2,8 @@
 pragma solidity 0.8.26;
 
 import { Ownable } from "@openzeppelin/contracts/access/Ownable.sol";
-import { Ownable2Step } from "@openzeppelin/contracts/access/Ownable2Step.sol";
 import { ReentrancyGuard } from "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
+import { NonRenounceableOwnable2Step } from "./utils/NonRenounceableOwnable2Step.sol";
 import { IDrandOracle } from "./interfaces/IDrandOracle.sol";
 import { IVault } from "./interfaces/IVault.sol";
 import { IClaimManager } from "./interfaces/IClaimManager.sol";
@@ -20,7 +20,7 @@ import { PackRegistry } from "./PackRegistry.sol";
 ///         bucket; the other 55% is guaranteed to the lower tiers — the per-tier bucket IS the cap.
 ///         Void-on-miss (§14): a day is drawable ONLY during the following day; miss it and its pot
 ///         simply stays in the vault. No catch-up — that would hand the keeper a timing advantage.
-contract RaffleEngine is Ownable2Step, ReentrancyGuard {
+contract RaffleEngine is NonRenounceableOwnable2Step, ReentrancyGuard {
     IDrandOracle public immutable drand;
     PackRegistry public immutable packs;
     IVault public immutable vault;
@@ -52,9 +52,11 @@ contract RaffleEngine is Ownable2Step, ReentrancyGuard {
     uint256 public minPot;
     // Owner-set bound on a single day's payout (audit H-3): RaffleEngine was the only draw engine without a
     // potCap, so a known winner could DELAY runDraw while convert() kept funding this vault, then draw an
-    // inflated pot (the tier-bucket split caps the winner's FRACTION, never the pot's absolute size). Default
-    // uncapped for back-compat; owner sets a concrete cap at launch. Excess over the cap rolls forward.
-    uint256 public potCap = type(uint256).max;
+    // inflated pot (the tier-bucket split caps the winner's FRACTION, never the pot's absolute size).
+    // audit F14 (pass-5): REQUIRED (> 0) at construction now — matches minPot and HolderDrawEngine. No more
+    // type(uint256).max fail-open default that let a sole entrant capture a whole rolled-forward balance
+    // before the owner remembered to setPotCap. Excess over the cap rolls forward.
+    uint256 public potCap;
     mapping(uint32 => bool) public drawn;
 
     event WinnersPerDaySet(uint256 k);
@@ -78,12 +80,15 @@ contract RaffleEngine is Ownable2Step, ReentrancyGuard {
         uint256 genesis_,
         uint256 k_,
         uint256 minPot_,
+        uint256 potCap_,
         address initialOwner
     ) Ownable(initialOwner) {
-        // audit F5: minPot is REQUIRED (> 0) at construction. The config-independent guard only floors at
-        // ~10*winnersPerDay wei — far too low — so a 0 default let a dust donation consume a day AND burn
-        // real purchased tickets. Now fail-closed on-chain like Jackpot/HolderDraw.
-        if (minPot_ == 0) revert BadMinPot();
+        // audit F14 (pass-5): potCap is REQUIRED (> 0) at construction — no fail-open type(uint256).max
+        // default. audit F5: minPot is REQUIRED (> 0) and now cross-checked <= potCap at construction too
+        // (the config-independent guard only floors at ~10*winnersPerDay wei — far too low). Fail-closed
+        // on-chain exactly like HolderDrawEngine.
+        if (potCap_ == 0) revert BadPotCap();
+        if (minPot_ == 0 || minPot_ > potCap_) revert BadMinPot();
         drand = IDrandOracle(drand_);
         packs = PackRegistry(packs_);
         vault = IVault(vault_);
@@ -93,6 +98,7 @@ contract RaffleEngine is Ownable2Step, ReentrancyGuard {
         if (k_ == 0 || k_ > MAX_K) revert BadK();
         winnersPerDay = k_;
         minPot = minPot_;
+        potCap = potCap_;
     }
 
     function setWinnersPerDay(uint256 k) external onlyOwner {

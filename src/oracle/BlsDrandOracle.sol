@@ -55,6 +55,7 @@ contract BlsDrandOracle is IDrandOracle {
     error TimestampBeforeGenesis();
 
     error BadDrandParams();
+    error PrecompileUnavailable(); // audit F10 (pass-5)
 
     constructor(uint256 drandGenesis_, uint256 drandPeriod_) {
         // audit H-6/L-11: pin the drand SCHEDULE constants to quicknet, exactly like the crypto constants
@@ -63,6 +64,18 @@ contract BlsDrandOracle is IDrandOracle {
         if (drandGenesis_ != 1_692_803_367 || drandPeriod_ != 3) revert BadDrandParams();
         drandGenesis = drandGenesis_;
         drandPeriod = drandPeriod_;
+
+        // audit F10 (pass-5): FAIL-CLOSED DEPLOY GATE. Every draw and the rarity reveal are a hard liveness
+        // dependency on the EIP-2537 BLS12-381 precompiles; on a chain that lacks them a staticcall to the
+        // precompile address hits an empty account and returns success with EMPTY returndata (not a revert),
+        // so the absence is silent. Probe them here so this oracle can NEVER be deployed where they are
+        // missing — the on-chain equivalent of script/bls_precompile_check.sh. G1ADD(inf,inf)==inf: 256 zero
+        // bytes in -> a well-formed 128-byte G1 point out (absent -> 0-length). PAIRING of one infinity pair
+        // == 1 (GT identity): 384 zero bytes in -> 32 bytes ending 0x01 (absent -> 0-length).
+        (bool okAdd, bytes memory addOut) = BLS_G1ADD.staticcall(new bytes(256));
+        if (!okAdd || addOut.length != 128) revert PrecompileUnavailable();
+        (bool okPair, bytes memory pairOut) = BLS_PAIRING.staticcall(new bytes(384));
+        if (!okPair || pairOut.length != 32 || pairOut[31] != 0x01) revert PrecompileUnavailable();
     }
 
     /// @notice Permissionless: submit round `round`'s uncompressed (128-byte) drand signature. Stores

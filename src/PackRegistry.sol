@@ -2,7 +2,7 @@
 pragma solidity 0.8.26;
 
 import { Ownable } from "@openzeppelin/contracts/access/Ownable.sol";
-import { Ownable2Step } from "@openzeppelin/contracts/access/Ownable2Step.sol";
+import { NonRenounceableOwnable2Step } from "./utils/NonRenounceableOwnable2Step.sol";
 import { IDrandOracle } from "./interfaces/IDrandOracle.sol";
 import { IPackRegistry } from "./interfaces/IRegistries.sol";
 import { INFTCollection } from "./interfaces/INFTCollection.sol";
@@ -16,7 +16,7 @@ import { INFTCollection } from "./interfaces/INFTCollection.sol";
 /// @dev    Cadence: DAILY. Ticket life: 7 days. A cohort minted on day D is eligible for the
 ///         draws on days D+1 .. D+7 (7 shots), then falls out of the sliding window. Expiry is
 ///         therefore free — an aged cohort is simply never in-window again; no per-ticket cleanup.
-contract PackRegistry is IPackRegistry, Ownable2Step {
+contract PackRegistry is IPackRegistry, NonRenounceableOwnable2Step {
     // ─── tiers ───────────────────────────────────────────────────────────────
     uint8 internal constant COMMON = 0;
     uint8 internal constant UNCOMMON = 1;

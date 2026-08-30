@@ -30,7 +30,17 @@ contract ClaimManager is IClaimManager, Ownable2Step, ReentrancyGuard {
     // per-vault binding, an engine's blast radius is its own game's vault and no more.
     mapping(address => address) public engineVault;
 
+    // audit F1 (pass-5): every other authority binding in the system is write-once (BaseVault.controller,
+    // the registries' recorder, PackRegistry.engine/nft, the adapters' poolKey). setEngine was the lone
+    // re-settable authority gate — a compromised owner could rebind an engine to an attacker contract and
+    // drain each vault's FREE balance via registerClaim->reserve->claim. We keep the four bindings mutable
+    // during launch wiring (and the M-1 de-auth-to-zero lever) up until the owner calls lockEngines() ONCE,
+    // after which the engine<->vault map is frozen forever — the same "immutable after launch" posture as
+    // BaseVault.controller (M-14/H-10). Deploy arms this at the end of wiring.
+    bool public enginesLocked;
+
     event EngineSet(address indexed engine, address indexed vault);
+    event EnginesLocked();
     event ClaimRegistered(
         uint256 indexed id, address vault, address recipient, uint256 amount, uint64 deadline
     );
@@ -46,14 +56,26 @@ contract ClaimManager is IClaimManager, Ownable2Step, ReentrancyGuard {
     error ZeroRecipient();
     error BadDeadline();
     error NotRegistered();
+    error EnginesAlreadyLocked(); // audit F1 (pass-5)
 
     constructor(address initialOwner) Ownable(initialOwner) { }
 
     /// @notice Authorize `e` to register claims AGAINST `vault` only (audit M-1). Pass `vault = address(0)`
     ///         to de-authorize. An engine may be bound to exactly one vault; re-binding overwrites.
+    /// @dev    audit F1 (pass-5): reverts once lockEngines() has been called — the bindings are then final.
     function setEngine(address e, address vault) external onlyOwner {
+        if (enginesLocked) revert EnginesAlreadyLocked();
         engineVault[e] = vault;
         emit EngineSet(e, vault);
+    }
+
+    /// @notice One-way, irreversible: freeze the engine<->vault bindings forever (audit F1, pass-5). Called
+    ///         once by the owner after all four engines are wired and verified at launch. After this, no
+    ///         owner (or compromised owner key) can rebind an engine to drain a vault's free balance — the
+    ///         same immutability BaseVault.controller already has, extended to ClaimManager's delegated map.
+    function lockEngines() external onlyOwner {
+        enginesLocked = true;
+        emit EnginesLocked();
     }
 
     /// @inheritdoc IClaimManager

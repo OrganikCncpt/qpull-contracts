@@ -1,6 +1,6 @@
 # QPULL — Audit Remediation & Security Model
 
-This document tracks the external LeftClaw AI audits of `qpull-contracts` across three passes:
+This document tracks the external AI audits of `qpull-contracts` across five passes:
 
 - **Pass 1** (commit `47d9c4f`, 20H/24M/17L) — remediation in §§1–5.
 - **Pass 2 / job 737** (commit `6dd4dec`, 1C/8H/18M) — remediation in **§7**.
@@ -8,8 +8,12 @@ This document tracks the external LeftClaw AI audits of `qpull-contracts` across
   flash accounting and has been **re-built as a V4 hook**; see **§8**. That revision also passed an
   internal adversarial multi-agent review (§8) and added the hook's test suite plus vendored `v4-core`
   v4.0.0 so the hook can be verified against the real `PoolManager`.
-- **Pass 3, an independent audit** (commit `9518c02`, 0C/4H/8M/18L) — remediation in **§10**. Every
-  code-fixable finding is fixed (local suite: 136 tests green).
+- **Pass 3, an independent audit** (commit `9518c02`, 0C/4H/8M/18L) — remediation in **§10**.
+- **Pass 4, a deep multi-agent audit** (commit `93e5790`, 1C/4H/1MH/9M/4L/1I) — remediation in **§11**.
+- **Pass 5, a 20-agent three-phase audit** (commit `7db9056`, 3H/2M/9L/6I) — remediation in **§12**. Every
+  code-fixable finding is fixed (local suite: **179 tests green**), including the previously-open LP/tax gap
+  (pass-4 F4 / pass-5 F6): **liquidity provision is now restricted to the protocol** (hook re-mined to
+  `0x1844` with a `beforeAddLiquidity` gate).
 
 Every High/Medium/Low finding is mapped below to one of: **fixed in code**, **resolved by governance**,
 **accepted (bounded)**, **removed**, or **false positive**. The local test suite is green after all code
@@ -208,9 +212,19 @@ and setter **M-13**). Properties:
   never let a registry fault brick the pool (a failed record costs only that trade's rewards, `RecordFailed`).
 - **`afterInitialize`** restricts pool creation: only the deployer may create the canonical pool (no
   front-run of the gate window) and no other pool may attach the hook (no reward-farm pools).
-- **Address flags** (`AFTER_INITIALIZE | AFTER_SWAP | AFTER_SWAP_RETURNS_DELTA = 0x1044`) are mined with a
-  CREATE2 salt (`script/HookMiner.sol`); `test/HookMiner.t.sol` proves the miner target and the constructor's
-  own `BadFlags` self-check agree (a launch-day revert if they ever drift).
+- **Address flags** (`AFTER_INITIALIZE | BEFORE_ADD_LIQUIDITY | AFTER_SWAP | AFTER_SWAP_RETURNS_DELTA =
+  0x1844`) are mined with a CREATE2 salt (`script/HookMiner.sol`); `test/HookMiner.t.sol` proves the miner
+  target and the constructor's own `BadFlags` self-check agree (a launch-day revert if they ever drift). The
+  `BEFORE_ADD_LIQUIDITY` bit (pass-5 F6) restricts liquidity provision to the protocol — see §12.
+- **`beforeAddLiquidity`** reverts unless the liquidity provider is the protocol (`sender == initializer` for
+  a contract LP-manager, or `tx.origin == initializer` for the deployer EOA via a router), closing the
+  untaxed LP acquire/dispose side-door. **Operational notes (accepted):** (1) the gate keys on the initializer
+  identity, so that key must never sign a transaction that calls untrusted code — during such a tx an attacker
+  contract could add a position (and, since removes are ungated, later withdraw it); (2) because the hook is
+  immutable and the shipped `initializer` is the deployer EOA, all future LP adds are permanently bound to
+  that EOA (not migratable to the launch timelock/multisig) — keep it secured; the protocol can always
+  *remove* its own LP (removes are ungated). Permissionless community LP is disabled by design (the pool is
+  protocol-owned liquidity; permissionless LP in a taxed-swap pool is itself the exploit).
 - The Treasury's `QpullWethAdapter` is the hook's **`exemptSender`** (conversion swaps pay no fee);
   `setPoolKey` verifies that binding on-chain.
 
@@ -233,14 +247,21 @@ Required steps not wired by `Deploy.s.sol`:
 
 1. **`Treasury.convert()` tax currency:** the QpullWethAdapter is the hook's `exemptSender`; `Deploy` wires
    `setTreasury` + `setPoolKey` for it. Confirm the WETH→QUOTRON adapter's `setTreasury` too. *(H-1 pass-1)*
-2. **`setMinPot(<floor>)`** on **all four** engines (Raffle, Jackpot, HolderDraw, Leaderboard) and
-   **`Treasury.setMaxConvertPerCall(<pool-sized>)`** — both default to a permissive value and **must** be set
-   to concrete, pool-sized bounds at launch. *(C-1, H-3)*
-3. **`JackpotEngine.setPotCap`** / **`HolderDrawEngine`** constructor cap — concrete per-draw bounds. *(H-3B/M-9)*
+2. **Engine floors + caps are now constructor-required (pass-5 F14, F5).** `Deploy.s.sol` reads
+   `RAFFLE_/JACKPOT_/LEADERBOARD_/HOLDER_MIN_POT` **and** `RAFFLE_/JACKPOT_/LEADERBOARD_POT_CAP` (+ the
+   HolderDraw cap/ceiling) via fail-closed `vm.envUint` and passes them at construction — set every one to a
+   concrete, pool-sized value or the deploy reverts. *(C-1, H-3, pass-5 F14)*
+3. **`Treasury.setMaxConvertPerCall` / `setMaxWethConvertPerCall`** still default permissive — set both to
+   pool-sized ceilings at launch. `Deploy` auto-arms **`ClaimManager.lockEngines()`** and
+   **`Treasury.lockRouting()`** at the end of wiring (pass-5 F1/F2) — verify the four engine↔vault bindings
+   and the routing destinations on-chain **before** relying on them being final. *(H-1/H-3, pass-5 F1/F2)*
 4. After the NFT mint closes: **`finalizeLaunch()`** (seals rarity), then **`withdrawProceeds()`**. *(H-13)*
 5. **GO-LIVE (H-2):** from the deployer key, `poolManager.initialize(canonicalPoolKey, sqrtPriceX96)` **then
    seed LP immediately** (back-to-back, ideally one multicall/block). Initialize stamps `launchTime` and opens
-   the first-hour gate; a gap between initialize and LP silently shortens the effective gate.
+   the first-hour gate; a gap between initialize and LP silently shortens the effective gate. **LP is now
+   gated (pass-5 F6): the seed tx must be signed by the `initializer` EOA (the deployer) — `beforeAddLiquidity`
+   reverts unless `tx.origin == initializer`.** Any later LP adds must likewise come from that key;
+   permissionless community LP is disabled by design (the canonical pool's depth is protocol-provided).
 6. Transfer all ownership to the **Timelock + multisig**; renounce where no further changes are expected. The
    tax hook has no owner, so nothing to transfer there. *(§2)*
 7. Verify the keeper is posting drand beacons on-chain before the first draw window closes.
@@ -320,11 +341,11 @@ decision, verified against QUOTRON's source, or pre-mainnet operational/crypto c
 | **F2** | High | **Corrected in §2.** There is no on-chain timelock/pause; the model is "transfer ownership to an external timelock+multisig at launch, verify on-chain." The doc no longer implies a code-level timelock. |
 | **F11** | Med | `setWinnersPerDay` has no cooldown (unlike `setTicketPrice`). Owner-trust: a reactive retune after a public beacon needs the owner key; the §2 timelock (delay > the 1-day draw window) prevents in-window reaction. Documented; not code-hardened (a cooldown wouldn't fully close it while the owner can set it before the window). |
 
-### Open — design decision (not yet actioned)
+### RESOLVED in pass-5 (§12 F6) — was an open design decision
 
-| # | Sev | Decision |
+| # | Sev | Decision → resolution |
 |---|---|---|
-| **F4** | High | `QpullTaxHook` implements only swap callbacks (`0x1044`), so **adding/removing concentrated liquidity bypasses the 4% tax and the first-hour gate** — a single-sided LP position is an untaxed route to acquire/dispose of QPULL, undermining the tax that funds the games. Because we are **pre-launch**, this IS fixable (unlike the auditor's post-deploy framing): add a `beforeAddLiquidity` gate restricting LP provision to the protocol and re-mine the hook address. This restricts permissionless community LP, so it is a **product decision** pending the team's call. Until decided, the canonical pool's liquidity should be treated as protocol-only. |
+| **F4** | High | `QpullTaxHook` implemented only swap callbacks (`0x1044`), so **adding/removing concentrated liquidity bypassed the 4% tax and the first-hour gate** — a single-sided LP position was an untaxed route to acquire/dispose of QPULL, undermining the tax that funds the games. **Decided + built (pass-5 F6): restrict LP to the protocol.** The hook now carries the `BEFORE_ADD_LIQUIDITY` flag (`REQUIRED_FLAGS = 0x1844`) and a `beforeAddLiquidity` callback that reverts unless `tx.origin == initializer`; the hook address was re-mined. Because no third party can ADD liquidity, none can hold a position to exploit — so gating add alone closes both directions. Trade-off (accepted): no permissionless community LP; the canonical pool's depth is protocol-provided. |
 
 ### Accepted / verified against source / conditional
 
@@ -341,9 +362,48 @@ decision, verified against QUOTRON's source, or pre-mainnet operational/crypto c
 
 ---
 
+## 12. Fifth pass — independent audit (commit `7db9056`) — 3H / 2M / 9L / 6I (20-agent, 3-phase)
+
+An independent 20-agent, three-phase audit (context → 8 breadth domains → 12 blind depth agents). Its finding
+IDs (F1–F14) are this pass's own and are **unrelated to pass-4's F-numbers**. Every finding was
+adversarially re-verified against source (and the live RH chain where relevant) before action; the
+convergent theme was the codebase's own **write-once pattern not being applied to a few authority bindings**.
+Local suite: **179 tests green** (+22 regressions). Its F6 (the LP/tax gap = pass-4's open F4) was actioned
+this pass — restrict LP to the protocol — so it is in **Fixed in code**, not accepted.
+
+### Fixed in code
+
+| # | Sev | Finding | Change |
+|---|---|---|---|
+| **F1** | High | `ClaimManager.setEngine` was the lone re-settable authority gate (every sibling binding is write-once), so a compromised owner could rebind an engine to an attacker contract and drain each vault's **free** balance | Added one-way **`lockEngines()`** — the four engine↔vault bindings stay mutable through launch wiring (preserving the M-1 de-auth lever), then the owner freezes them forever. `Deploy`/`DeployTestnet` arm it at the end of wiring. Reserved winner claims were never reachable (the `payOut` guard). |
+| **F2** | High | `Treasury.setRouting` was re-settable, so a compromised owner could redirect **all** converted prize funding + the 20% team cut | Added one-way **`lockRouting()`**, armed by the deploy scripts after `setRouting`. The keeper role is left rotatable by design (its only residual is the bounded, cap-limited convert MEV — F9/M-2). |
+| **F5** | Med | Both adapters' `setTreasury` were re-settable despite a "set once" comment; since `QpullWethAdapter` is the hook's immutable `exemptSender`, re-pointing it grants a permanent **0%-tax** QPULL→WETH route (or DoSes `convert()`) | `setTreasury` is now **write-once** (+ zero-check) on both adapters, mirroring `setPoolKey`. |
+| **F14** | Low | `potCap` defaulted to `type(uint256).max` in Raffle/Jackpot/Leaderboard (only HolderDraw required it), and the deploy scripts never capped Jackpot/Leaderboard at all — a sole entrant in a quiet period could capture a whole rolled-forward vault balance | `potCap` is now a **required (> 0) constructor argument** in all four engines, cross-checked `minPot ≤ potCap`, matching HolderDraw + `minPot`. `Deploy` reads `RAFFLE_/JACKPOT_/LEADERBOARD_POT_CAP` (fail-closed `vm.envUint`) and passes them at construction. |
+| **F7** | Low | `QuotronRouterAdapter` accepted ETH (`receive`) with no rescue — a router refund or force-sent ETH would strand | Added owner-only **`sweepETH(to)`** (touches no WETH/QUOTRON accounting — the adapter holds neither between calls). |
+| **F10** | Low | The whole randomness system is a hard liveness dependency on the EIP-2537 precompiles; a staticcall to a missing precompile returns success with **empty** data (silent) | `BlsDrandOracle`'s constructor now **probes G1ADD + PAIRING and reverts `PrecompileUnavailable`** if absent — an on-chain fail-closed deploy gate (the script `bls_precompile_check.sh` made mandatory in code). |
+| **F13** | Low | `renounceOwnership` was callable everywhere; renouncing a contract that still needs its owner (engine `setPotCap`, `PackRegistry` re-peg, `Treasury` keeper rotation) permanently bricks those knobs | New `NonRenounceableOwnable2Step` base reverts renounce on the six contracts needing a live owner (engines, `PackRegistry`, `Treasury`); two-step transfer to the launch timelock is unaffected. Contracts whose owner is vestigial post-launch (vaults, registries, NFT, adapters) keep the standard base. |
+| **F6** | Low→High | LP add/remove ran no hook code (flags `0x1044`), so the 4% tax + first-hour gate didn't cover liquidity ops — an untaxed side-door to acquire/dispose QPULL (also **pass-4's open F4**). **Restrict LP to the protocol:** the hook now carries `BEFORE_ADD_LIQUIDITY` (`REQUIRED_FLAGS = 0x1844`) and a `beforeAddLiquidity` gate reverting unless `tx.origin == initializer`; the CREATE2 hook address was re-mined; deploy scripts + all hook tests updated. Gating **add** alone closes both directions (no non-protocol position can exist to remove). Trade-off (accepted): no permissionless community LP. |
+
+### Confirmed but accepted / documented (no code change)
+
+| # | Sev | Disposition |
+|---|---|---|
+| **F3** | High | External QUOTRON admin (pause / blacklist / `bannedVenueCodehash`) can freeze all payouts. Already documented (§9 launch check, §10 trust note). Options weighed: a rescue path re-introduces the vault-drain lever the immutable-controller design removed (rejected); "distinct bytecode per vault" is defeated by QUOTRON's **global** pause and per-address blacklist (security theater). **Doc, not code.** |
+| **F4** | Med | Raffle (1h) + pack-tier (≤1d) reveal-lag structurally cannot exceed the sequencer's 4-day back-dating bound — the daily cadence must leave a same-following-day draw window. This is the documented **M-7** trusted-sequencer residual (Jackpot 5d / HolderDraw 4.5d are code-enforced). No in-scope fix without changing the game cadence. |
+| ~~**F6**~~ | — | **Moved to Fixed in code above** (protocol-only LP built; hook re-mined to `0x1844`). This was pass-4's open F4. |
+| **F8** | Low | `HolderDrawEngine.snapshot()` permits single-block (transient) holding eligibility — inherent to any instant snapshot. The atomic snapshot (pass-4 F3) closed the *serial* exploit; the beacon is time-locked so a renter buys only a proportional chance, bounded by `potCap`. Documented (§3 H-5); a multi-block snapshot is future work. |
+| **F9** | Low | Jackpot/HolderDraw `REVEAL_LAG` is hardcoded against the L1 `SequencerInbox.maxTimeVariation` (re-verified on-chain = 4 days; margins 1d / 0.5d). An L2 can't read its own L1 inbox, so no dynamic fix — **runbook: monitor `maxTimeVariation` and treat an increase as a governance event.** |
+| **F11** | Low | **Refuted as a DoS.** The `ReentrancyGuardTransient` guard is redundant given `onlyPoolManager` + the PoolManager's unlock-lock, and TSTORE is **proven live on both RH chains** (V4 PoolManager, which requires it, runs there). Kept as belt-and-braces; dropping it would force a hook re-mine for zero gain. |
+| **F12** | Low | **Refuted for RH.** Probed block `gasLimit` = `0x4000000000000` (2⁵⁰) on both chains — the ~6.4M snapshot and K=200 draw fit with orders of magnitude of headroom (loops are hard-bounded at SUPPLY=250 / MAX_K=200). |
+
+**Leads** (sub-threshold, flagged): keeper-self-sandwich (= F9/M-2, governance), `claimBatch` payout-revert coupling (self-mitigable — the caller drops the bad id / uses single `claim`), fee-on-transfer solvency (QUOTRON verified non-FoT), Treasury no-rescue-if-QUOTRON-pool-illiquid (same disposition as F3 — no owner rescue by design). **Informational** I1–I6 (rounding favors the trader <1 wei; `setEngine` framing = F1; ETH-sweep = F7; void-window availability; `roundAt` convention pending the crypto review; JackpotEngine reads the beacon before its void checks — a gracefulness asymmetry, retryable either way) all accepted.
+
+---
+
 *This remediation was prepared with AI assistance and is not a substitute for an independent human security
 review. A dedicated cryptographic review of `BlsDrandOracle` and a **V4-hook specialist review of
 `QpullTaxHook`** remain recommended before mainnet. QUOTRON's ERC-404 semantics (M-6/M-8), Robinhood
 Chain's EIP-2537 support (H-4), and its sequencer `delaySeconds` (M-7) have all been verified on-chain /
 against source and are addressed above; the residual QUOTRON-admin trust surface is documented and gated
-by the §9 launch check. Pass-4's F4 (V4 liquidity-callback tax gap) is an open pre-launch design decision.*
+by the §9 launch check. Pass-4's F4 / pass-5's F6 (V4 liquidity-callback tax gap) is now **resolved** —
+liquidity provision is restricted to the protocol (hook re-mined to `0x1844`, §12).*

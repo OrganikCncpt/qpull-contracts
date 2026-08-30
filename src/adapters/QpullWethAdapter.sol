@@ -60,6 +60,8 @@ contract QpullWethAdapter is ISwapAdapter, IUnlockCallback, Ownable2Step, Reentr
     error NotTreasury();
     error BadPoolKey();
     error PoolKeyAlreadySet();
+    error TreasuryAlreadySet(); // audit F5 (pass-5)
+    error ZeroAddress();
 
     constructor(address poolManager_, address qpull_, address weth_, address initialOwner)
         Ownable(initialOwner)
@@ -95,9 +97,12 @@ contract QpullWethAdapter is ISwapAdapter, IUnlockCallback, Ownable2Step, Reentr
 
     /// @notice Authorize the Treasury as the sole caller of swapExactIn. This adapter MUST be tax-exempt on
     ///         QPULLToken for convert() to work; without this gate ANY address could route a QPULL->WETH sell
-    ///         through it and pay 0% tax instead of 4% (audit H-1). Set once to the deployed Treasury at
-    ///         launch. Until set, swapExactIn is closed (fail-safe).
+    ///         through it and pay 0% tax instead of 4% (audit H-1). WRITE-ONCE (audit F5, pass-5): since this
+    ///         adapter is the hook's immutable exemptSender, re-pointing `treasury` would hand an attacker a
+    ///         permanent 0%-tax QPULL->WETH route (or DoS convert()). Until set, swapExactIn is closed.
     function setTreasury(address t) external onlyOwner {
+        if (treasury != address(0)) revert TreasuryAlreadySet();
+        if (t == address(0)) revert ZeroAddress();
         treasury = t;
         emit TreasurySet(t);
     }

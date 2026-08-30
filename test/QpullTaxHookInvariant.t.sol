@@ -23,7 +23,7 @@ import { MockRecorder } from "./mocks/MockRecorder.sol";
 /// @notice Shared launch-shape setUp: canonical QPULL/WETH pool created WITH QpullTaxHook on the REAL
 ///         PoolManager, deep liquidity seeded, gate warped past. Reused by the fuzz and invariant suites.
 abstract contract HookFuzzBase is Test {
-    uint160 constant FLAGS = (1 << 12) | (1 << 6) | (1 << 2);
+    uint160 constant FLAGS = (1 << 12) | (1 << 11) | (1 << 6) | (1 << 2); // +beforeAddLiquidity (0x1844)
     uint160 constant SQRT_1_1 = 79_228_162_514_264_337_593_543_950_336;
     uint160 constant MIN_PRICE_P1 = 4_295_128_739 + 1;
     uint160 constant MAX_PRICE_M1 = 1_461_446_703_485_210_103_287_273_052_203_988_822_378_723_970_342 - 1;
@@ -92,6 +92,7 @@ abstract contract HookFuzzBase is Test {
         weth.approve(address(liqRouter), type(uint256).max);
 
         manager.initialize(key, SQRT_1_1);
+        vm.prank(address(this), address(this)); // audit F6: tx.origin == initializer for the LP seed
         liqRouter.modifyLiquidity(key, IV4PoolManager.ModifyLiquidityParams(FULL_LO, FULL_HI, 1e24, 0), "");
         vm.warp(block.timestamp + 2 hours); // past the first-hour gate — fuzz actors need not hold an NFT
     }

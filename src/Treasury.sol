@@ -5,8 +5,8 @@ import { IERC20 } from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import { SafeERC20 } from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
 import { IERC721Receiver } from "@openzeppelin/contracts/token/ERC721/IERC721Receiver.sol";
 import { Ownable } from "@openzeppelin/contracts/access/Ownable.sol";
-import { Ownable2Step } from "@openzeppelin/contracts/access/Ownable2Step.sol";
 import { ReentrancyGuard } from "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
+import { NonRenounceableOwnable2Step } from "./utils/NonRenounceableOwnable2Step.sol";
 import { ISwapAdapter } from "./interfaces/ISwapAdapter.sol";
 
 /// @title  Treasury
@@ -20,7 +20,7 @@ import { ISwapAdapter } from "./interfaces/ISwapAdapter.sol";
 ///         Swaps route through ISwapAdapter with slippage bounds, keeper-gated (see convert()).
 ///         The QpullWethAdapter is fee-exempt on the hook (exemptSender), so the protocol-side
 ///         QPULL→WETH conversion swap is itself untaxed.
-contract Treasury is Ownable2Step, ReentrancyGuard, IERC721Receiver {
+contract Treasury is NonRenounceableOwnable2Step, ReentrancyGuard, IERC721Receiver {
     using SafeERC20 for IERC20;
 
     IERC20 public immutable qpull;
@@ -55,8 +55,16 @@ contract Treasury is Ownable2Step, ReentrancyGuard, IERC721Receiver {
     uint256 public maxWethConvertPerCall = type(uint256).max;
     mapping(address => bool) public isKeeper; // only an authorized keeper may trigger convert()
 
+    // audit F2 (pass-5): setRouting sets convert()'s unconditional payout destinations (the three prize
+    // vaults + the 20% team cut). It was freely re-settable, so a compromised owner could redirect ALL
+    // converted prize funding to attacker addresses. We keep it mutable through staged launch wiring, then
+    // the owner calls lockRouting() ONCE to freeze the destinations forever. The keeper role stays mutable
+    // on purpose — it is a rotatable hot key whose only residual is the bounded, cap-limited convert MEV.
+    bool public routingLocked;
+
     event AdaptersSet(address qpullWeth, address wethQuotron);
     event RoutingSet(address prizeVault, address jackpotVault, address leaderboardVault, address team);
+    event RoutingLocked();
     event ConvertThresholdSet(uint256 convertThreshold);
     event MaxConvertPerCallSet(uint256 maxConvertPerCall);
     event MaxWethConvertPerCallSet(uint256 maxWethConvertPerCall);
@@ -67,6 +75,7 @@ contract Treasury is Ownable2Step, ReentrancyGuard, IERC721Receiver {
     error BelowThreshold();
     error NotKeeper();
     error SwapShortfall();
+    error RoutingAlreadyLocked(); // audit F2 (pass-5)
 
     modifier onlyKeeper() {
         if (!isKeeper[msg.sender]) revert NotKeeper();
@@ -98,6 +107,7 @@ contract Treasury is Ownable2Step, ReentrancyGuard, IERC721Receiver {
         external
         onlyOwner
     {
+        if (routingLocked) revert RoutingAlreadyLocked(); // audit F2 (pass-5): destinations are final
         if (
             prize_ == address(0) || jackpot_ == address(0) || leaderboard_ == address(0)
                 || team_ == address(0)
@@ -109,6 +119,15 @@ contract Treasury is Ownable2Step, ReentrancyGuard, IERC721Receiver {
         leaderboardVault = leaderboard_;
         team = team_;
         emit RoutingSet(prize_, jackpot_, leaderboard_, team_);
+    }
+
+    /// @notice One-way, irreversible: freeze convert()'s payout destinations forever (audit F2, pass-5).
+    ///         The owner calls this once at launch after setRouting is verified. After this, no owner (or
+    ///         compromised owner key) can redirect prize funding or the team cut. The keeper role is left
+    ///         rotatable by design (setKeeper); its only residual is the bounded, cap-limited convert MEV.
+    function lockRouting() external onlyOwner {
+        routingLocked = true;
+        emit RoutingLocked();
     }
 
     function setConvertThreshold(uint256 t) external onlyOwner {

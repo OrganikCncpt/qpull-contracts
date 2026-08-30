@@ -2,7 +2,7 @@
 pragma solidity 0.8.26;
 
 import { Ownable } from "@openzeppelin/contracts/access/Ownable.sol";
-import { Ownable2Step } from "@openzeppelin/contracts/access/Ownable2Step.sol";
+import { NonRenounceableOwnable2Step } from "./utils/NonRenounceableOwnable2Step.sol";
 import { ReentrancyGuard } from "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
 import { IDrandOracle } from "./interfaces/IDrandOracle.sol";
 import { IVault } from "./interfaces/IVault.sol";
@@ -27,7 +27,7 @@ import { INFTCollection } from "./interfaces/INFTCollection.sol";
 ///         G4 (-EV / bounded): the pot is min(freeBalance, potCap) under an immutable POT_CAP_CEILING, so
 ///           per-NFT EV <= pot/250 with no super-linear splitting gain and no rolled-over honeypot.
 ///         Reuses the protocol's void-on-miss rollover, pull-claims (ClaimManager), and no-owner-drain vault.
-contract HolderDrawEngine is Ownable2Step, ReentrancyGuard {
+contract HolderDrawEngine is NonRenounceableOwnable2Step, ReentrancyGuard {
     IDrandOracle public immutable drand; // MUST be the time-locked BlsDrandOracle
     INFTCollection public immutable nft;
     IVault public immutable vault; // dedicated HolderDraw vault (its own QUOTRON inventory)

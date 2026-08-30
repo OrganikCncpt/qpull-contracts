@@ -2,8 +2,8 @@
 pragma solidity 0.8.26;
 
 import { Ownable } from "@openzeppelin/contracts/access/Ownable.sol";
-import { Ownable2Step } from "@openzeppelin/contracts/access/Ownable2Step.sol";
 import { ReentrancyGuard } from "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
+import { NonRenounceableOwnable2Step } from "./utils/NonRenounceableOwnable2Step.sol";
 import { IVault } from "./interfaces/IVault.sol";
 import { IClaimManager } from "./interfaces/IClaimManager.sol";
 import { LeaderboardRegistry } from "./LeaderboardRegistry.sol";
@@ -19,7 +19,7 @@ import { LeaderboardRegistry } from "./LeaderboardRegistry.sol";
 ///         like the sibling engines): the pot is a live freeBalance snapshot, so unbounded catch-up would
 ///         let a stale week grab the whole running vault balance (audit H-2). A missed week's accrual simply
 ///         rolls forward into the next distributed week's pot.
-contract LeaderboardEngine is Ownable2Step, ReentrancyGuard {
+contract LeaderboardEngine is NonRenounceableOwnable2Step, ReentrancyGuard {
     LeaderboardRegistry public immutable registry;
     IVault public immutable vault;
     IClaimManager public immutable claimManager;
@@ -28,7 +28,10 @@ contract LeaderboardEngine is Ownable2Step, ReentrancyGuard {
     uint256 internal constant WEEK = 7 days;
     uint256 public constant CLAIM_WINDOW = 30 days;
 
-    uint256 public potCap = type(uint256).max; // audit M-7: bound a single week's payout; excess rolls forward
+    // audit M-7: bound a single week's payout; excess rolls forward. audit F14 (pass-5): REQUIRED (> 0) at
+    // construction now (no fail-open type(uint256).max default) — a sole board member in a quiet week is
+    // 100% of totalPoints, so uncapped it could take a whole rolled-forward vault balance in one distribute.
+    uint256 public potCap;
     uint256 public minPot; // audit C-1: floor below which distribute voids WITHOUT consuming the week
     mapping(uint256 => bool) public distributed;
 
@@ -48,11 +51,14 @@ contract LeaderboardEngine is Ownable2Step, ReentrancyGuard {
         address claim_,
         uint256 genesis_,
         uint256 minPot_,
+        uint256 potCap_,
         address o
     ) Ownable(o) {
-        // audit F5: minPot REQUIRED (> 0) — the config-independent guard only floors at ~5-20 wei, so a 0
-        // default let a dust donation consume a whole week's top-25 payout. Fail-closed on-chain now.
-        if (minPot_ == 0) revert BadMinPot();
+        // audit F14 (pass-5): potCap REQUIRED (> 0) at construction; audit F5: minPot REQUIRED (> 0) and
+        // cross-checked <= potCap — the config-independent guard only floors at ~5-20 wei, so a 0 default let
+        // a dust donation consume a whole week's top-25 payout. Fail-closed on-chain like HolderDrawEngine.
+        if (potCap_ == 0) revert BadPotCap();
+        if (minPot_ == 0 || minPot_ > potCap_) revert BadMinPot();
         registry = LeaderboardRegistry(registry_);
         vault = IVault(vault_);
         claimManager = IClaimManager(claim_);
@@ -61,6 +67,7 @@ contract LeaderboardEngine is Ownable2Step, ReentrancyGuard {
         if (LeaderboardRegistry(registry_).genesis() != genesis_) revert GenesisMismatch();
         genesis = genesis_;
         minPot = minPot_;
+        potCap = potCap_;
     }
 
     /// @notice Bound a single week's payout (audit M-7). Never below the minPot floor (audit L-3).

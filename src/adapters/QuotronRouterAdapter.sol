@@ -28,12 +28,16 @@ contract QuotronRouterAdapter is ISwapAdapter, Ownable2Step, ReentrancyGuard {
 
     event DeadlineBufferSet(uint256 seconds_);
     event TreasurySet(address treasury);
+    event SweptETH(address indexed to, uint256 amount);
 
     error UnsupportedPath();
     error MinOutRequired();
     error NotTreasury();
     error Slippage();
     error BadBuffer();
+    error TreasuryAlreadySet(); // audit F5 (pass-5)
+    error ZeroAddress();
+    error SweepFailed();
 
     constructor(address router_, address weth_, address quotron_, address initialOwner)
         Ownable(initialOwner)
@@ -43,10 +47,26 @@ contract QuotronRouterAdapter is ISwapAdapter, Ownable2Step, ReentrancyGuard {
         quotron = quotron_;
     }
 
-    /// @notice Authorize the Treasury as the sole caller of swapExactIn (audit H-1). Set once at launch.
+    /// @notice Authorize the Treasury as the sole caller of swapExactIn (audit H-1). WRITE-ONCE
+    ///         (audit F5, pass-5): re-pointing `treasury` would DoS convert(); mirrors the write-once
+    ///         intent the comment always stated. Until set, swapExactIn is closed (fail-safe).
     function setTreasury(address t) external onlyOwner {
+        if (treasury != address(0)) revert TreasuryAlreadySet();
+        if (t == address(0)) revert ZeroAddress();
         treasury = t;
         emit TreasurySet(t);
+    }
+
+    /// @notice Owner-only rescue for native ETH stranded in this adapter (audit F7, pass-5). In normal
+    ///         operation the adapter holds no ETH (WETH is unwrapped and forwarded to the router in the
+    ///         same tx); this recovers a router refund or force-sent ETH. Touches no WETH/QUOTRON
+    ///         accounting — the adapter never holds those between calls.
+    function sweepETH(address to) external onlyOwner {
+        if (to == address(0)) revert ZeroAddress();
+        uint256 bal = address(this).balance;
+        (bool ok,) = to.call{ value: bal }("");
+        if (!ok) revert SweepFailed();
+        emit SweptETH(to, bal);
     }
 
     function setDeadlineBuffer(uint256 s) external onlyOwner {

@@ -35,7 +35,7 @@ import { MockDrandOracle } from "./mocks/MockDrandOracle.sol";
 ///         swap shapes, first-hour gate, exemption, registry fan-out + try/catch, pool-creation
 ///         control, and the adapter's hooked-pool binding.
 contract QpullTaxHookTest is Test {
-    uint160 constant FLAGS = (1 << 12) | (1 << 6) | (1 << 2); // afterInitialize | afterSwap | returnsDelta
+    uint160 constant FLAGS = (1 << 12) | (1 << 11) | (1 << 6) | (1 << 2); // +beforeAddLiquidity (0x1844)
     uint160 constant SQRT_1_1 = 79_228_162_514_264_337_593_543_950_336; // 1:1
     uint160 constant MIN_PRICE_P1 = 4_295_128_739 + 1;
     uint160 constant MAX_PRICE_M1 = 1_461_446_703_485_210_103_287_273_052_203_988_822_378_723_970_342 - 1;
@@ -121,6 +121,8 @@ contract QpullTaxHookTest is Test {
         }
 
         manager.initialize(key, SQRT_1_1); // sender = this = the hook's initializer
+        // audit F6: LP is now gated to the initializer via tx.origin — prank so tx.origin == this for the seed
+        vm.prank(address(this), address(this));
         liqRouter.modifyLiquidity(key, IV4PoolManager.ModifyLiquidityParams(FULL_LO, FULL_HI, 1e24, 0), "");
     }
 
@@ -201,6 +203,30 @@ contract QpullTaxHookTest is Test {
         bad.fee = 500; // wrong fee => not the canonical pool
         vm.expectRevert(); // NotCanonicalPool, wrapped by v4-core's hook-revert bubbling
         manager.initialize(bad, SQRT_1_1);
+    }
+
+    // audit F6 / pass-4 F4: liquidity provision is restricted to the protocol (the pool's initializer),
+    // closing the untaxed LP side-door for acquiring/disposing QPULL.
+    function test_F6_nonInitializerCannotAddLiquidity() public {
+        address stranger = makeAddr("lpStranger");
+        qpull.mint(stranger, 1e24);
+        weth.mint(stranger, 1e24);
+        vm.startPrank(stranger, stranger); // msg.sender AND tx.origin = stranger (not the initializer)
+        qpull.approve(address(liqRouter), type(uint256).max);
+        weth.approve(address(liqRouter), type(uint256).max);
+        vm.expectRevert(); // LiquidityRestricted, wrapped by v4-core's hook-revert bubbling
+        liqRouter.modifyLiquidity(key, IV4PoolManager.ModifyLiquidityParams(FULL_LO, FULL_HI, 1e24, 0), "");
+        vm.stopPrank();
+    }
+
+    function test_F6_initializerCanAddLiquidity() public {
+        // the protocol (initializer == this) can still provide liquidity — tx.origin == initializer
+        qpull.mint(address(this), 1e24);
+        weth.mint(address(this), 1e24);
+        qpull.approve(address(liqRouter), type(uint256).max);
+        weth.approve(address(liqRouter), type(uint256).max);
+        vm.prank(address(this), address(this));
+        liqRouter.modifyLiquidity(key, IV4PoolManager.ModifyLiquidityParams(FULL_LO, FULL_HI, 1e23, 0), "");
     }
 
     function test_initializeFrontRunBlocked() public {
@@ -406,6 +432,7 @@ contract QpullTaxHookTest is Test {
         V4PoolKey memory k4 = key;
         k4.hooks = IV4Hooks(hook4Addr);
         manager.initialize(k4, SQRT_1_1);
+        vm.prank(address(this), address(this)); // audit F6: tx.origin == initializer for the LP seed
         liqRouter.modifyLiquidity(k4, IV4PoolManager.ModifyLiquidityParams(FULL_LO, FULL_HI, 1e24, 0), "");
         vm.warp(block.timestamp + 2 hours); // past the gate
 

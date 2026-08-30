@@ -55,9 +55,9 @@ import { INFTCollection } from "../interfaces/INFTCollection.sol";
 ///             not nested); it only bars a true nested re-entry, which cannot happen anyway.
 ///
 ///         V4 mechanics (verified against vendored v4-core v4.0.0):
-///           - address flag bits: AFTER_INITIALIZE (1<<12) | AFTER_SWAP (1<<6) |
-///             AFTER_SWAP_RETURNS_DELTA (1<<2) = 0x1044 — the deployer mines a CREATE2 salt so the
-///             hook address carries exactly these bits (script/HookMiner.sol);
+///           - address flag bits: AFTER_INITIALIZE (1<<12) | BEFORE_ADD_LIQUIDITY (1<<11) |
+///             AFTER_SWAP (1<<6) | AFTER_SWAP_RETURNS_DELTA (1<<2) = 0x1844 — the deployer mines a CREATE2
+///             salt so the hook address carries exactly these bits (script/HookMiner.sol);
 ///           - afterSwap returns (selector, int128 hookDeltaUnspecified). POSITIVE means the swapper
 ///             pays the hook that amount of the unspecified currency (Hooks.sol: "the caller has to
 ///             pay for the hook's delta"; swapDelta -= hookDelta). The hook's credit is settled by
@@ -77,7 +77,10 @@ contract QpullTaxHook is ReentrancyGuardTransient {
     uint256 public constant GATE_DURATION = 1 hours; // spec §16 first-hour holder gate
 
     // Hook address flag bits this contract requires (v4-core Hooks.sol bit layout).
-    uint160 public constant REQUIRED_FLAGS = (1 << 12) | (1 << 6) | (1 << 2); // 0x1044
+    // AFTER_INITIALIZE (1<<12) | BEFORE_ADD_LIQUIDITY (1<<11) | AFTER_SWAP (1<<6) | AFTER_SWAP_RETURNS_DELTA
+    // (1<<2). The BEFORE_ADD_LIQUIDITY bit (audit F6 / pass-4 F4) makes the PoolManager invoke this hook on
+    // every liquidity-add so we can restrict LP to the protocol — closing the untaxed LP side-door.
+    uint160 public constant REQUIRED_FLAGS = (1 << 12) | (1 << 11) | (1 << 6) | (1 << 2); // 0x1844
     uint160 internal constant ALL_FLAG_MASK = (1 << 14) - 1;
 
     // ─── immutable wiring (no owner, no setters) ─────────────────────────────
@@ -123,6 +126,7 @@ contract QpullTaxHook is ReentrancyGuardTransient {
     error NotCanonicalPool();
     error NotInitializer();
     error Gated();
+    error LiquidityRestricted(); // audit F6/pass-4 F4: only the protocol may provide liquidity
 
     modifier onlyPoolManager() {
         // Both callbacks mutate protocol state (launchTime, registry records) — if anyone could call
@@ -182,6 +186,32 @@ contract QpullTaxHook is ReentrancyGuardTransient {
         launchTime = block.timestamp;
         emit Launched(block.timestamp);
         return this.afterInitialize.selector;
+    }
+
+    /// @notice Liquidity provision is restricted to the protocol (audit F6 / pass-4 F4). The 4% tax fires on
+    ///         SWAPS (afterSwap); adding/removing liquidity is NOT a swap, so V4 charges no tax on it. Left
+    ///         open, that is an untaxed side-door to acquire/dispose QPULL: seed single-sided liquidity just
+    ///         off spot, let other traders' TAXED swaps push price through the range so the position converts
+    ///         (WETH->QPULL to buy, QPULL->WETH to sell), then withdraw — QPULL moved at 0% instead of 4%,
+    ///         starving the prize funding. Gating ADD to the pool's `initializer` makes the canonical pool's
+    ///         depth protocol-provided; because no third party can ADD, none ever holds a position to REMOVE,
+    ///         so gating add alone closes both directions (no beforeRemoveLiquidity needed). Identity is
+    ///         `tx.origin` — the EOA that signed the LP tx — the same unspoofable identity the first-hour gate
+    ///         uses: a router/periphery sits between the LP and the PoolManager, so `sender` is not the LP.
+    ///         Fails closed. Trade-off (accepted): no permissionless community LP.
+    function beforeAddLiquidity(
+        address sender,
+        PoolKey calldata key,
+        IPoolManager.ModifyLiquidityParams calldata,
+        bytes calldata
+    ) external view onlyPoolManager returns (bytes4) {
+        if (!isCanonical(key)) revert NotCanonicalPool(); // this hook serves exactly one pool
+        // The protocol identifies two ways, so this works whether the initializer is an EOA that signs the
+        // LP tx through a router (tx.origin) OR a protocol-owned LP-manager contract that calls
+        // modifyLiquidity directly (sender = that contract). A third party is NEITHER: their router is not
+        // the initializer (sender), and they did not sign as the initializer (tx.origin). Fails closed.
+        if (sender != initializer && tx.origin != initializer) revert LiquidityRestricted();
+        return this.beforeAddLiquidity.selector;
     }
 
     /// @notice The tax. Takes 4% of the swap's unspecified currency for the Treasury, enforces the

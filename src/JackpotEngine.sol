@@ -2,8 +2,8 @@
 pragma solidity 0.8.26;
 
 import { Ownable } from "@openzeppelin/contracts/access/Ownable.sol";
-import { Ownable2Step } from "@openzeppelin/contracts/access/Ownable2Step.sol";
 import { ReentrancyGuard } from "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
+import { NonRenounceableOwnable2Step } from "./utils/NonRenounceableOwnable2Step.sol";
 import { IDrandOracle } from "./interfaces/IDrandOracle.sol";
 import { IVault } from "./interfaces/IVault.sol";
 import { IClaimManager } from "./interfaces/IClaimManager.sol";
@@ -15,7 +15,7 @@ import { JackpotRegistry } from "./JackpotRegistry.sol";
 ///         the pot equals that period's contributions and the farm cap holds.
 /// @dev    Void-on-miss (§14): drawable only during the following period; miss it and the pot stays
 ///         in the vault. (A void period's rollover is a known edge for the hardening pass.)
-contract JackpotEngine is Ownable2Step, ReentrancyGuard {
+contract JackpotEngine is NonRenounceableOwnable2Step, ReentrancyGuard {
     IDrandOracle public immutable drand;
     JackpotRegistry public immutable registry;
     IVault public immutable vault;
@@ -24,11 +24,11 @@ contract JackpotEngine is Ownable2Step, ReentrancyGuard {
 
     uint256 public constant PERIOD = 14 days;
     uint256 public constant CLAIM_WINDOW = 30 days;
-    // Owner-set bound on a single draw's payout (audit H-3B/M-9). Default uncapped for back-compat; the
-    // owner sets a concrete cap at launch (behind the timelock). Caps how much a delaying known-winner can
+    // Owner-set bound on a single draw's payout (audit H-3B/M-9). audit F14 (pass-5): REQUIRED (> 0) at
+    // construction now (no fail-open type(uint256).max default) — caps how much a delaying known-winner can
     // absorb from the next period, and keeps a single QUOTRON prize within one-transfer gas. Excess rolls
     // forward in the vault, like HolderDrawEngine's potCap.
-    uint256 public potCap = type(uint256).max;
+    uint256 public potCap;
     // MINIMUM pot below which a draw voids WITHOUT consuming the period — closes the dust-donation grief
     // where anyone raises freeBalance() by a few wei to force a 1-wei winner and roll the real 14-day pot
     // forward (audit C-1). REQUIRED (> 0) at construction (audit H-2): unlike RaffleEngine/LeaderboardEngine,
@@ -65,9 +65,14 @@ contract JackpotEngine is Ownable2Step, ReentrancyGuard {
         address claim_,
         uint256 genesis_,
         uint256 minPot_,
+        uint256 potCap_,
         address o
     ) Ownable(o) {
-        if (minPot_ == 0) revert BadMinPot(); // audit H-2: no unsafe 0 default — enforced on-chain at deploy
+        // audit F14 (pass-5): potCap REQUIRED (> 0) at construction; audit H-2: minPot REQUIRED (> 0) and
+        // cross-checked <= potCap — fail-closed on-chain at deploy, matching HolderDrawEngine.
+        if (potCap_ == 0) revert BadPotCap();
+        if (minPot_ == 0 || minPot_ > potCap_) revert BadMinPot();
+        potCap = potCap_;
         drand = IDrandOracle(drand_);
         registry = JackpotRegistry(registry_);
         vault = IVault(vault_);

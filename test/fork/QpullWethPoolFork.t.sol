@@ -74,7 +74,7 @@ contract QpullWethPoolForkTest is Test {
     string RPC = vm.envOr("RH_RPC_URL", string("https://rpc.mainnet.chain.robinhood.com"));
 
     uint160 constant SQRT_1_1 = 79_228_162_514_264_337_593_543_950_336; // 2**96 -> price 1:1
-    uint160 constant FLAGS = (1 << 12) | (1 << 6) | (1 << 2);
+    uint160 constant FLAGS = (1 << 12) | (1 << 11) | (1 << 6) | (1 << 2); // +beforeAddLiquidity (0x1844)
     uint160 constant MIN_PRICE_P1 = 4_295_128_739 + 1;
     uint160 constant MAX_PRICE_M1 = 1_461_446_703_485_210_103_287_273_052_203_988_822_378_723_970_342 - 1;
 
@@ -131,12 +131,14 @@ contract QpullWethPoolForkTest is Test {
         pm.initialize(key, SQRT_1_1); // sender = this = initializer; stamps launchTime on the REAL chain
         assertEq(QpullTaxHook(hookAddr).launchTime(), block.timestamp, "launch stamped");
 
-        // Seed deep, full-range liquidity via the helper (liquidity callbacks are not flagged).
+        // Seed deep, full-range liquidity via the helper. audit F6: liquidity-add is now gated to the
+        // initializer (tx.origin) — prank so the protocol's seed passes the beforeAddLiquidity check.
         V4LiquidityHelper lp = new V4LiquidityHelper(pm);
         vm.deal(address(this), 60_000 ether);
         IWETHDeposit(WETH).deposit{ value: 60_000 ether }();
         IERC20(WETH).transfer(address(lp), 60_000 ether);
         qpull.mint(address(lp), 200_000 ether);
+        vm.prank(address(this), address(this));
         lp.addLiquidity(key, -887_220, 887_220, uint128(20_000 ether)); // full range (multiples of 60)
 
         // Bind the adapter — setPoolKey verifies the hook exempts it, on-chain.
