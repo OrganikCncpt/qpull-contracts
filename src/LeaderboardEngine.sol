@@ -3,6 +3,7 @@ pragma solidity 0.8.26;
 
 import { Ownable } from "@openzeppelin/contracts/access/Ownable.sol";
 import { Ownable2Step } from "@openzeppelin/contracts/access/Ownable2Step.sol";
+import { ReentrancyGuard } from "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
 import { IVault } from "./interfaces/IVault.sol";
 import { IClaimManager } from "./interfaces/IClaimManager.sol";
 import { LeaderboardRegistry } from "./LeaderboardRegistry.sol";
@@ -18,7 +19,7 @@ import { LeaderboardRegistry } from "./LeaderboardRegistry.sol";
 ///         like the sibling engines): the pot is a live freeBalance snapshot, so unbounded catch-up would
 ///         let a stale week grab the whole running vault balance (audit H-2). A missed week's accrual simply
 ///         rolls forward into the next distributed week's pot.
-contract LeaderboardEngine is Ownable2Step {
+contract LeaderboardEngine is Ownable2Step, ReentrancyGuard {
     LeaderboardRegistry public immutable registry;
     IVault public immutable vault;
     IClaimManager public immutable claimManager;
@@ -38,23 +39,29 @@ contract LeaderboardEngine is Ownable2Step {
     error AlreadyDistributed();
     error OutsideWindow();
     error BadPotCap();
+    error GenesisMismatch();
 
     constructor(address registry_, address vault_, address claim_, uint256 genesis_, address o) Ownable(o) {
         registry = LeaderboardRegistry(registry_);
         vault = IVault(vault_);
         claimManager = IClaimManager(claim_);
+        // audit L-2: cross-check the registry's genesis (mirrors RaffleEngine/JackpotEngine's H-8 check) —
+        // a divergence would desync the distribute() window from the registry's accrual-week numbering.
+        if (LeaderboardRegistry(registry_).genesis() != genesis_) revert GenesisMismatch();
         genesis = genesis_;
     }
 
-    /// @notice Bound a single week's payout (audit M-7). Excess over the cap rolls forward.
+    /// @notice Bound a single week's payout (audit M-7). Never below the minPot floor (audit L-3).
     function setPotCap(uint256 c) external onlyOwner {
-        if (c == 0) revert BadPotCap();
+        if (c == 0 || c < minPot) revert BadPotCap();
         potCap = c;
         emit PotCapSet(c);
     }
 
     /// @notice Set the minimum pot below which distribute voids without consuming the week (audit C-1).
+    ///         Cross-checked against potCap (audit L-3): minPot > potCap would silently void every week.
     function setMinPot(uint256 m) external onlyOwner {
+        if (m > potCap) revert BadPotCap();
         minPot = m;
         emit MinPotSet(m);
     }
@@ -64,7 +71,7 @@ contract LeaderboardEngine is Ownable2Step {
         return (block.timestamp - genesis) / WEEK;
     }
 
-    function distribute(uint256 week) external {
+    function distribute(uint256 week) external nonReentrant {
         if (distributed[week]) revert AlreadyDistributed();
         if (currentWeek() != week + 1) revert OutsideWindow(); // the following week only — else void (audit H-2)
 

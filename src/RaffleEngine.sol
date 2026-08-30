@@ -3,6 +3,7 @@ pragma solidity 0.8.26;
 
 import { Ownable } from "@openzeppelin/contracts/access/Ownable.sol";
 import { Ownable2Step } from "@openzeppelin/contracts/access/Ownable2Step.sol";
+import { ReentrancyGuard } from "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
 import { IDrandOracle } from "./interfaces/IDrandOracle.sol";
 import { IVault } from "./interfaces/IVault.sol";
 import { IClaimManager } from "./interfaces/IClaimManager.sol";
@@ -19,7 +20,7 @@ import { PackRegistry } from "./PackRegistry.sol";
 ///         bucket; the other 55% is guaranteed to the lower tiers — the per-tier bucket IS the cap.
 ///         Void-on-miss (§14): a day is drawable ONLY during the following day; miss it and its pot
 ///         simply stays in the vault. No catch-up — that would hand the keeper a timing advantage.
-contract RaffleEngine is Ownable2Step {
+contract RaffleEngine is Ownable2Step, ReentrancyGuard {
     IDrandOracle public immutable drand;
     PackRegistry public immutable packs;
     IVault public immutable vault;
@@ -31,6 +32,15 @@ contract RaffleEngine is Ownable2Step {
     // Settling beacon reveals REVEAL_LAG after the day closes, so it is unknowable while any in-day ticket
     // is still buyable — otherwise a last-second buyer could grind entries against a now-public beacon
     // (audit-2 root cause; mirrors PackRegistry's revealDelay).
+    // AUDIT M-7 residual (documented, accepted): RH's sequencer may back-date block.timestamp by up to
+    // maxTimeVariation.delaySeconds = 4 days (confirmed on-chain). A DAILY cadence structurally cannot set
+    // REVEAL_LAG above ~1 day (it must leave a same-following-day draw window), so — unlike the 14-day
+    // jackpot and weekly holder draw, which DO exceed the 4-day bound — the daily raffle cannot code-
+    // enforce this against a maximally back-dating sequencer. It relies on the standard trusted-sequencer
+    // assumption every Arbitrum L2 already requires for all timestamp logic. The residual is bounded: the
+    // daily pot is small and split across tier buckets among K winners (far lower value than the winner-
+    // take-all jackpot), and the attack requires the RH-operated sequencer to catastrophically mis-stamp
+    // time — which would break the whole chain, not just this raffle. See SECURITY.md §10 (M-7).
     uint256 internal constant REVEAL_LAG = 1 hours;
     uint256 public constant MAX_K = 200; // audit M-3: one-block-safe (was 1000; ~120-140k gas/winner)
     uint256 internal constant BPS = 10_000;
@@ -40,17 +50,24 @@ contract RaffleEngine is Ownable2Step {
     // the dust-donation grief where anyone raises freeBalance() to force a draw that burns live tickets for
     // ~1-wei prizes (audit C-1). Default 0 => MUST be set at launch (runbook).
     uint256 public minPot;
+    // Owner-set bound on a single day's payout (audit H-3): RaffleEngine was the only draw engine without a
+    // potCap, so a known winner could DELAY runDraw while convert() kept funding this vault, then draw an
+    // inflated pot (the tier-bucket split caps the winner's FRACTION, never the pot's absolute size). Default
+    // uncapped for back-compat; owner sets a concrete cap at launch. Excess over the cap rolls forward.
+    uint256 public potCap = type(uint256).max;
     mapping(uint32 => bool) public drawn;
 
     event WinnersPerDaySet(uint256 k);
     event DrawExecuted(uint32 indexed day, uint256 pot, uint256 winners);
     event MinPotSet(uint256 minPot);
+    event PotCapSet(uint256 potCap);
 
     error AlreadyDrawn();
     error BadDay();
     error OutsideWindow();
     error BadK();
     error GenesisMismatch();
+    error BadPotCap();
 
     constructor(
         address drand_,
@@ -78,9 +95,18 @@ contract RaffleEngine is Ownable2Step {
     }
 
     /// @notice Set the minimum pot below which a draw voids without consuming the day (audit C-1).
+    ///         Cross-checked against potCap (audit L-3): minPot > potCap would silently void every draw.
     function setMinPot(uint256 m) external onlyOwner {
+        if (m > potCap) revert BadPotCap();
         minPot = m;
         emit MinPotSet(m);
+    }
+
+    /// @notice Bound a single day's payout (audit H-3). Excess over the cap rolls forward.
+    function setPotCap(uint256 c) external onlyOwner {
+        if (c == 0 || c < minPot) revert BadPotCap(); // audit L-3: never below the minPot floor
+        potCap = c;
+        emit PotCapSet(c);
     }
 
     /// @notice The drand round whose beacon settles day `day` — publishes REVEAL_LAG after day+1 opens,
@@ -102,7 +128,7 @@ contract RaffleEngine is Ownable2Step {
         return 1000; // Common 10%
     }
 
-    function runDraw(uint32 day) external {
+    function runDraw(uint32 day) external nonReentrant {
         if (drawn[day]) revert AlreadyDrawn();
         if (day == 0) revert BadDay();
         if (currentDay() != day + 1) revert OutsideWindow(); // the day after only — else void
@@ -112,6 +138,7 @@ contract RaffleEngine is Ownable2Step {
         // fix). We also don't mark the day drawn — a retry can still pay out if the vault is funded later
         // within this window; missing the whole window voids the day and the pot rolls forward.
         uint256 pot = vault.freeBalance();
+        if (pot > potCap) pot = potCap; // audit H-3: bound the single-day payout; excess rolls forward
         // Skip (WITHOUT burning tickets or marking the day drawn) when the pot is too small to pay even a full
         // field of winners in the SMALLEST tier bucket. This guarantees every drawn winner receives >=1 wei,
         // so no ticket is ever spent for a zero payout (audit H-17; subsumes the old pot==0 guard). The

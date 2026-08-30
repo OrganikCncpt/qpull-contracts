@@ -53,6 +53,7 @@ contract BlsDrandOracle is IDrandOracle {
     error BadSigLength();
     error InvalidBeacon();
     error PrecompileFailed();
+    error TimestampBeforeGenesis();
 
     error BadDrandParams();
 
@@ -139,7 +140,11 @@ contract BlsDrandOracle is IDrandOracle {
     }
 
     function roundAt(uint256 timestamp) external view returns (uint64) {
-        if (timestamp <= drandGenesis) return 1;
+        // audit L-16: REVERT rather than fail open. A timestamp at/before drand genesis (Aug 2023) would
+        // otherwise bind a draw to round 1 — a beacon public for years — making that draw resolvable the
+        // instant it is created. Unreachable in normal use (every consumer's cutoff is the 2026 protocol
+        // genesis plus a lag, far past drandGenesis), so reverting closes a latent fail-open with no cost.
+        if (timestamp <= drandGenesis) revert TimestampBeforeGenesis();
         // First round whose scheduled publish time is at/AFTER `timestamp` (CEIL), per IDrandOracle.
         // A FLOOR here would bind a draw to the round that publishes up to (period-1)s BEFORE the cutoff,
         // so the settling beacon could be public while entries/snapshots for that draw are still open

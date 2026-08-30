@@ -4,10 +4,12 @@ This document tracks the external LeftClaw AI audits of `qpull-contracts` across
 
 - **Pass 1** (commit `47d9c4f`, 20H/24M/17L) — remediation in §§1–5.
 - **Pass 2 / job 737** (commit `6dd4dec`, 1C/8H/18M) — remediation in **§7**.
-- **H-2, the architecture change** (this revision) — the 4% transfer tax was structurally incompatible
-  with Uniswap-V4 flash accounting and has been **re-built as a V4 hook**; see **§8**. This revision also
-  passed an internal adversarial multi-agent review (§8) and adds the hook's test suite plus vendored
-  `v4-core` v4.0.0 to this repo so the hook can be verified against the real `PoolManager`.
+- **H-2, the architecture change** — the 4% transfer tax was structurally incompatible with Uniswap-V4
+  flash accounting and has been **re-built as a V4 hook**; see **§8**. That revision also passed an
+  internal adversarial multi-agent review (§8) and added the hook's test suite plus vendored `v4-core`
+  v4.0.0 so the hook can be verified against the real `PoolManager`.
+- **Pass 3, an independent audit** (commit `9518c02`, 0C/4H/8M/18L) — remediation in **§10**. Every
+  code-fixable finding is fixed (local suite: 136 tests green).
 
 Every High/Medium/Low finding is mapped below to one of: **fixed in code**, **resolved by governance**,
 **accepted (bounded)**, **removed**, or **false positive**. The local test suite is green after all code
@@ -237,7 +239,51 @@ Required steps not wired by `Deploy.s.sol`:
 
 ---
 
+## 10. Third pass — independent audit (commit `9518c02`) — 0C / 4H / 8M / 18L
+
+An independent three-phase audit of the H-2 revision. No Critical. Every code-fixable finding is fixed
+(local suite green, 136 tests, incl. a regression per fix); the rest are governance-covered, conditioned on
+external facts this repo cannot verify (QUOTRON's ERC-404 semantics; Robinhood Chain's precompile/clock
+config), or accepted with rationale.
+
+### Fixed in code
+
+| # | Sev | Finding | Change |
+|---|---|---|---|
+| **H-1** | High | `convert()`'s WETH→QUOTRON leg had no per-call cap — a WETH donation could brick the whole pipeline (the H-2 rework introduced WETH as a second, donation-inflatable tax currency) | Added `maxWethConvertPerCall`, symmetric to `maxConvertPerCall`; the WETH slice is capped and the remainder drains over later calls. |
+| **H-2** | High | `minPot` shipped at an unsafe `0` default on Jackpot/HolderDraw (their only config-independent guard voids at 1 / 5 wei), so a missed runbook step re-opened the C-1 dust-grief | `minPot` is now a **required (> 0) constructor argument** on `JackpotEngine`/`HolderDrawEngine` (fail-closed on-chain); `Deploy` also wires every engine's floor so it never depends on a post-deploy step. |
+| **H-3** | High | `RaffleEngine` was the only draw engine without a `potCap` — a delaying winner could inflate their own payout | Added an owner-set `potCap` (clamp identical to the sibling engines); excess rolls forward. |
+| **M-1** | Med | `ClaimManager`'s bool engine allowlist had no per-vault binding — one authorized/compromised engine could drain **all four** vaults, defeating `BaseVault`'s immutable-controller guarantee | `engineVault` binds each engine to exactly **one** vault; `registerClaim` reverts `WrongVault` otherwise. Blast radius is now a single game's vault. |
+| **M-4** | Med | `setExcluded` could run mid-snapshot, freezing an internally-inconsistent owner set | Reverts `SnapshotInProgress` while the current week's snapshot is partway done. |
+| **M-5** | Med | A rounded-to-zero split leg would revert `convert()` under a zero-value-reverting QUOTRON | Each of the three split transfers is guarded with `if (amount > 0)`; zeroed legs' value rides in the hourly remainder. |
+| **L-1** | Low | `nonReentrant` missing on 3 draw functions + `registerClaim` | Added to `RaffleEngine.runDraw`, `JackpotEngine.runDraw`, `LeaderboardEngine.distribute`, `ClaimManager.registerClaim` (defense-in-depth). |
+| **L-2** | Low | `LeaderboardEngine` missing the sibling engines' genesis cross-check | Added `GenesisMismatch` against `LeaderboardRegistry.genesis()`. |
+| **L-3** | Low | `minPot`/`potCap` setters didn't cross-validate (`potCap < minPot` silently voids every draw) | All engine setters now enforce `minPot <= potCap` both directions. |
+| **L-5** | Low | `Treasury.setAdapters` missing the zero-address guard `setRouting` has | Added. |
+| **L-10** | Low | `forceApprove` in `convert()` left a residual allowance | Reset to `0` after each swap. |
+| **L-16** | Low | `roundAt(ts <= drandGenesis)` returned round 1 (fail-open) | Now reverts `TimestampBeforeGenesis` (fail-closed; unreachable in normal use). |
+| **I-7** | Info | Misplaced NatSpec on `JackpotEngine.setPotCap` | Corrected. |
+
+### Governance-covered, conditional, or accepted
+
+| # | Sev | Disposition |
+|---|---|---|
+| **H-4** | High | **Operational, verified separately.** The EIP-2537 precompiles (`0x0b`/`0x0f`/`0x10`) were confirmed live on the actual Robinhood Chain RPC via a direct precompile probe during development (not inferred from `evm_version`), and the code is fail-closed if they were ever absent. Re-confirm on the final deploy target as a launch gate. |
+| **M-2** | Med | **Accepted / mitigated.** No trustworthy on-chain price reference exists (QPULL's only price is its own pool, so a TWAP is itself manipulable). Mitigated by the keeper gate (rotatable key) plus `maxConvertPerCall` **and now `maxWethConvertPerCall`**, which bound a single-slice sandwich; documented. |
+| **M-3** | Med | **Governance (§2)** — the timelock+multisig model is the resolution for re-settable bindings; the missing zero-check portion is fixed as L-5. |
+| **M-6, M-8** | Med | **Deployment preconditions on QUOTRON** (must not be fee-on-transfer; must not reduce a balance except via the holder's own outbound transfer). QUOTRON is a standard 18-decimal ERC-404; stated as a precondition pending its source / a live-fork verification pass. |
+| **M-7** | Med | **Confirmed and addressed by cadence.** RH's `maxTimeVariation.delaySeconds` was read directly from its SequencerInbox on Ethereum L1 (`0xBd0D173EEb87D57A09521c24388a12789F33ba96` → `delaySeconds = 345_600 = 4 days`; `futureSeconds = 3_600 = 1h`). The sealed-then-revealed guarantee is code-enforced iff `REVEAL_LAG > delaySeconds`. **`REVEAL_LAG` is now sized per cadence: JackpotEngine = 5 days and HolderDrawEngine = 4.5 days — both exceed the 4-day bound, so the two highest-value randomized draws (jackpot winner-take-all; weekly holder draw) are fully code-enforced** even against a maximally back-dating sequencer (their 14-day / 7-day windows absorb the lag). The **daily raffle** (and per-cohort pack-tier reveal) structurally cannot set `REVEAL_LAG` above ~1 day, so those remain `1h` and rely on the standard trusted-sequencer assumption every Arbitrum L2 already requires; the residual is bounded (a daily bucket-split pot is far lower value than the jackpot, and the attack needs the RH-operated sequencer to catastrophically mis-stamp time — which breaks the whole chain, not just this raffle). |
+| **L-4** | Low | **Runbook** — do not `renounceOwnership` on contracts that need ongoing hot-key rotation (keeper) or before mandatory bindings are set; set bindings first. |
+| **L-6, L-7** | Low | **Owner-trust / accepted** — mint-recipient choice and `baseURI` mutability are owner responsibilities; on-chain rarity is immutable regardless. |
+| **L-8, L-12** | Low | **Accepted (perk-only, immutable hook)** — the first-hour gate is anti-snipe, not fund-safety; `tx.origin` and the launch-time window are the deliberate design (§8). No fund impact. |
+| **L-9** | Low | **N/A** — QUOTRON is 18-decimal. |
+| **L-11** | Low | **Accepted design** — void-on-miss denies the keeper a timing advantage; a skipped window rolls funds forward (liveness, not loss). |
+| **L-13, L-14, L-15, L-17, L-18** | Low/Info | **Accepted** — single-chain deploy; adapter ETH is self-harm only; free-entry cap is a bounded shared allowance; the pairing subgroup check is standard precompile reliance (crypto review already recommended); OOG-vs-invalid-sig both revert with no state change. |
+
+---
+
 *This remediation was prepared with AI assistance and is not a substitute for an independent human security
 review. A dedicated cryptographic review of `BlsDrandOracle`, a **V4-hook specialist review of
-`QpullTaxHook`**, and confirmation of QUOTRON's ERC-404 transfer semantics remain recommended before
-mainnet.*
+`QpullTaxHook`**, and confirmation of **QUOTRON's ERC-404 semantics** remain recommended before mainnet.
+Robinhood Chain's EIP-2537 support and its sequencer `delaySeconds` (4 days) have been verified on-chain
+and are addressed above (H-4, M-7).*

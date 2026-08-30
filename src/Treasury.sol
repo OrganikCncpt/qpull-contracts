@@ -46,12 +46,20 @@ contract Treasury is Ownable2Step, ReentrancyGuard, IERC721Receiver {
     // an untaxed donation that inflates the balance beyond pool depth can't permanently brick convert() — the
     // keeper just drains the excess over several pool-sized slices (audit H-3). Excess stays as QPULL balance.
     uint256 public maxConvertPerCall = type(uint256).max;
+    // Max WETH swapped per convert() call — the mirror of maxConvertPerCall for the SECOND leg (audit H-1).
+    // Since the V4 hook now delivers sell-tax as WETH straight to this Treasury, WETH is a donation-inflatable
+    // balance too: without a cap, one large WETH donation would force the whole balance through the shallow
+    // QUOTRON pool in a single swap, and a revert there (oversized input) reverts the entire nonReentrant
+    // convert() — stranding the QPULL leg too, since convert() is the ONLY path that moves WETH out. Default
+    // uncapped; owner sets a pool-sized ceiling at launch and the keeper drains the excess over several calls.
+    uint256 public maxWethConvertPerCall = type(uint256).max;
     mapping(address => bool) public isKeeper; // only an authorized keeper may trigger convert()
 
     event AdaptersSet(address qpullWeth, address wethQuotron);
     event RoutingSet(address prizeVault, address jackpotVault, address leaderboardVault, address team);
     event ConvertThresholdSet(uint256 convertThreshold);
     event MaxConvertPerCallSet(uint256 maxConvertPerCall);
+    event MaxWethConvertPerCallSet(uint256 maxWethConvertPerCall);
     event KeeperSet(address indexed keeper, bool authorized);
     event Converted(uint256 qpullIn, uint256 wethOut, uint256 quotronOut, uint256 teamWeth);
 
@@ -80,6 +88,7 @@ contract Treasury is Ownable2Step, ReentrancyGuard, IERC721Receiver {
     }
 
     function setAdapters(address qpullWeth_, address wethQuotron_) external onlyOwner {
+        if (qpullWeth_ == address(0) || wethQuotron_ == address(0)) revert NotConfigured(); // audit L-5
         qpullWeth = ISwapAdapter(qpullWeth_);
         wethQuotron = ISwapAdapter(wethQuotron_);
         emit AdaptersSet(qpullWeth_, wethQuotron_);
@@ -113,6 +122,15 @@ contract Treasury is Ownable2Step, ReentrancyGuard, IERC721Receiver {
         if (m == 0) revert BelowThreshold();
         maxConvertPerCall = m;
         emit MaxConvertPerCallSet(m);
+    }
+
+    /// @notice Ceiling on WETH swapped per convert() call (audit H-1) — the mirror of maxConvertPerCall for
+    ///         the WETH→QUOTRON leg, so a WETH donation can't force an oversized single swap that bricks the
+    ///         whole pipeline. The keeper drains the excess in pool-sized slices.
+    function setMaxWethConvertPerCall(uint256 m) external onlyOwner {
+        if (m == 0) revert BelowThreshold();
+        maxWethConvertPerCall = m;
+        emit MaxWethConvertPerCallSet(m);
     }
 
     /// @notice Batch-convert accumulated QPULL tax into prize inventory + team WETH. KEEPER-ONLY.
@@ -151,13 +169,17 @@ contract Treasury is Ownable2Step, ReentrancyGuard, IERC721Receiver {
             uint256 wethBefore = weth.balanceOf(address(this));
             qpull.forceApprove(address(qpullWeth), qpullIn);
             qpullWeth.swapExactIn(address(qpull), address(weth), qpullIn, minWethOut, address(this));
+            qpull.forceApprove(address(qpullWeth), 0); // audit L-10: leave no residual allowance
             if (weth.balanceOf(address(this)) - wethBefore < minWethOut) revert SwapShortfall();
         } else {
             qpullIn = 0; // nothing swapped this call
         }
 
-        // 2. team slice — 20% of ALL tax revenue this batch, whichever currency it arrived in
+        // 2. team slice — 20% of the WETH processed THIS batch. wethOut is capped to a pool-sized slice
+        //    (audit H-1): the remainder stays as WETH balance and drains over subsequent convert() calls,
+        //    so a WETH donation can never force an oversized single QUOTRON swap that bricks the pipeline.
         uint256 wethOut = weth.balanceOf(address(this)); // swapped + hook-fee WETH; all of it is tax
+        if (wethOut > maxWethConvertPerCall) wethOut = maxWethConvertPerCall;
         uint256 teamWeth = (wethOut * TEAM_BPS) / BPS;
         weth.safeTransfer(team, teamWeth);
         uint256 prizeWeth = wethOut - teamWeth;
@@ -166,16 +188,20 @@ contract Treasury is Ownable2Step, ReentrancyGuard, IERC721Receiver {
         uint256 qBefore = quotron.balanceOf(address(this));
         weth.forceApprove(address(wethQuotron), prizeWeth);
         wethQuotron.swapExactIn(address(weth), address(quotron), prizeWeth, minQuotronOut, address(this));
+        weth.forceApprove(address(wethQuotron), 0); // audit L-10: leave no residual allowance
         uint256 qOut = quotron.balanceOf(address(this)) - qBefore;
         if (qOut < minQuotronOut) revert SwapShortfall();
 
-        // 4. split QUOTRON across the prize vaults (of the 8000 prize bps)
+        // 4. split QUOTRON across the prize vaults (of the 8000 prize bps). Each leg is guarded against a
+        //    zero-value transfer (audit M-5): a thin batch can floor toJackpot/toLeaderboard to 0 (their
+        //    value then rides in toHourly), and an adversarial QUOTRON that reverts on 0-value transfers
+        //    would otherwise brick convert() at small batch sizes.
         uint256 toJackpot = (qOut * JACKPOT_BPS) / PRIZE_BPS;
         uint256 toLeaderboard = (qOut * LEADERBOARD_BPS) / PRIZE_BPS;
         uint256 toHourly = qOut - toJackpot - toLeaderboard;
-        quotron.safeTransfer(prizeVault, toHourly);
-        quotron.safeTransfer(jackpotVault, toJackpot);
-        quotron.safeTransfer(leaderboardVault, toLeaderboard);
+        if (toHourly > 0) quotron.safeTransfer(prizeVault, toHourly);
+        if (toJackpot > 0) quotron.safeTransfer(jackpotVault, toJackpot);
+        if (toLeaderboard > 0) quotron.safeTransfer(leaderboardVault, toLeaderboard);
 
         emit Converted(qpullIn, wethOut, qOut, teamWeth);
     }

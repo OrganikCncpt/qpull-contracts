@@ -38,9 +38,13 @@ contract HolderDrawEngine is Ownable2Step, ReentrancyGuard {
     uint256 internal constant WEEK = 7 days;
     uint256 internal constant SNAP_WINDOW = 2 days; // snapshot only in the last 2 days of the week
     // Settling beacon reveals REVEAL_LAG AFTER the snapshot hard-closes (snapDeadline), so no snapshot
-    // write can ever see it — closes the audit-2 window where a floor-rounded beacon could publish a
-    // couple seconds before the snapshot closed. An hour of margin also defeats block.timestamp games.
-    uint256 internal constant REVEAL_LAG = 1 hours;
+    // write can ever see it. SIZED TO ROBINHOOD CHAIN'S SEQUENCER CLOCK (audit M-7): RH's SequencerInbox
+    // reports maxTimeVariation.delaySeconds = 345_600 (4 days, confirmed on-chain) — the max the sequencer
+    // may back-date block.timestamp. REVEAL_LAG must exceed it to be code-enforced rather than a
+    // trusted-sequencer assumption: 4.5 days > 4 days. The 7-day draw window absorbs this (leaves a
+    // ~2.5-day window to draw after the beacon reveals); the snapshot closes even further before the
+    // beacon (extra G3 margin). Closes M-7 for the weekly holder draw.
+    uint256 internal constant REVEAL_LAG = 4 days + 12 hours;
     uint256 internal constant WINNERS = 5;
     uint256 internal constant SUPPLY = 250;
     uint256 public constant CLAIM_WINDOW = 30 days;
@@ -49,9 +53,10 @@ contract HolderDrawEngine is Ownable2Step, ReentrancyGuard {
 
     uint256 public potCap; // owner re-pegs within bounds; clamped by POT_CAP_CEILING
     uint64 public lastPotAdjust;
-    // Owner-set MINIMUM pot below which a draw voids WITHOUT consuming the week — closes the dust-donation
-    // grief where anyone raises freeBalance() by a few wei to force a zero/near-zero payout that burns the
-    // week (audit C-1). Default 0 => MUST be set at launch (runbook).
+    // MINIMUM pot below which a draw voids WITHOUT consuming the week — closes the dust-donation grief where
+    // anyone raises freeBalance() by a few wei to force a near-zero payout that burns the week (audit C-1).
+    // REQUIRED (> 0) at construction (audit H-2): the only config-independent guard here is pot/WINNERS==0
+    // (voids below 5 wei), so a 0 default left a live 5-wei dust-grief. Owner re-tunes via setMinPot (<= potCap).
     uint256 public minPot;
 
     // Double-buffered by week parity so week W+1's snapshot can't clobber week W's frozen buffer.
@@ -75,8 +80,10 @@ contract HolderDrawEngine is Ownable2Step, ReentrancyGuard {
     error AdjustTooSoon();
     error AdjustOutOfBounds();
     error SnapshotClosed();
+    error SnapshotInProgress();
     error AlreadyDrawn();
     error OutsideWindow();
+    error BadMinPot();
 
     constructor(
         address drand_,
@@ -86,11 +93,13 @@ contract HolderDrawEngine is Ownable2Step, ReentrancyGuard {
         uint256 genesis_,
         uint256 potCap_,
         uint256 potCapCeiling_,
+        uint256 minPot_,
         address initialOwner
     ) Ownable(initialOwner) {
         if (potCap_ == 0 || potCapCeiling_ == 0 || potCap_ > potCapCeiling_) {
             revert BadPotCap();
         }
+        if (minPot_ == 0 || minPot_ > potCap_) revert BadMinPot(); // audit H-2/L-3: no unsafe 0 default
         drand = IDrandOracle(drand_);
         nft = INFTCollection(nft_);
         vault = IVault(vault_);
@@ -98,6 +107,7 @@ contract HolderDrawEngine is Ownable2Step, ReentrancyGuard {
         genesis = genesis_;
         potCap = potCap_;
         POT_CAP_CEILING = potCapCeiling_;
+        minPot = minPot_;
     }
 
     // ─── views (mirror the sibling engines) ──────────────────────────────────
@@ -230,6 +240,7 @@ contract HolderDrawEngine is Ownable2Step, ReentrancyGuard {
     ///         week, and never above the immutable POT_CAP_CEILING — so the knob can neither farm nor brick.
     function setPotCap(uint256 newCap) external onlyOwner {
         if (newCap == 0) revert PotCapZero();
+        if (newCap < minPot) revert BadMinPot(); // audit L-3: cap can never sit below the minPot floor
         if (newCap > POT_CAP_CEILING) revert AbovePotCeiling();
         if (block.timestamp < uint256(lastPotAdjust) + WEEK) revert AdjustTooSoon();
         uint256 cur = potCap;
@@ -242,12 +253,23 @@ contract HolderDrawEngine is Ownable2Step, ReentrancyGuard {
     }
 
     /// @notice Set the minimum pot below which a draw voids without consuming the week (audit C-1).
+    ///         Must stay > 0 and <= potCap (audit H-2/L-3).
     function setMinPot(uint256 m) external onlyOwner {
+        if (m == 0 || m > potCap) revert BadMinPot();
         minPot = m;
         emit MinPotSet(m);
     }
 
+    /// @notice Bar an address (protocol/escrow) from winning. Forbidden while the CURRENT week's snapshot is
+    ///         partway done (audit M-4): exclusion is frozen per-token as each chunk runs, so a mid-snapshot
+    ///         change would freeze an internally-inconsistent owner set (some of the account's tokens captured
+    ///         as owner, others as address(0)). Change it before the snapshot starts or after it completes.
     function setExcluded(address account, bool v) external onlyOwner {
+        uint256 week = currentPeriod();
+        uint256 buf = week & 1;
+        if (snapEpochOf[buf] == week + 1 && snapCursorOf[buf] > 0 && snapCursorOf[buf] < SUPPLY) {
+            revert SnapshotInProgress();
+        }
         excluded[account] = v;
         emit ExcludedSet(account, v);
     }

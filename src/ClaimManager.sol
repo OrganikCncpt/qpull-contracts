@@ -23,9 +23,14 @@ contract ClaimManager is IClaimManager, Ownable2Step, ReentrancyGuard {
 
     mapping(uint256 => Claim) public claims;
     uint256 public nextClaimId;
-    mapping(address => bool) public isEngine;
+    // audit M-1: each engine is bound to the ONE vault it may touch (0 = unauthorized). Previously a bare
+    // bool allowlist let any authorized engine reserve/pay against ANY vault — so a single compromised or
+    // mis-added engine could drain all four prize vaults, silently defeating BaseVault's much-emphasized
+    // immutable single-controller guarantee (the controller's OWN delegated authority was unscoped). With a
+    // per-vault binding, an engine's blast radius is its own game's vault and no more.
+    mapping(address => address) public engineVault;
 
-    event EngineSet(address indexed engine, bool authorized);
+    event EngineSet(address indexed engine, address indexed vault);
     event ClaimRegistered(
         uint256 indexed id, address vault, address recipient, uint256 amount, uint64 deadline
     );
@@ -33,6 +38,7 @@ contract ClaimManager is IClaimManager, Ownable2Step, ReentrancyGuard {
     event Swept(uint256 indexed id, uint256 amount);
 
     error NotEngine();
+    error WrongVault();
     error NotRecipient();
     error AlreadySettled();
     error Expired();
@@ -43,18 +49,23 @@ contract ClaimManager is IClaimManager, Ownable2Step, ReentrancyGuard {
 
     constructor(address initialOwner) Ownable(initialOwner) { }
 
-    function setEngine(address e, bool authorized) external onlyOwner {
-        isEngine[e] = authorized;
-        emit EngineSet(e, authorized);
+    /// @notice Authorize `e` to register claims AGAINST `vault` only (audit M-1). Pass `vault = address(0)`
+    ///         to de-authorize. An engine may be bound to exactly one vault; re-binding overwrites.
+    function setEngine(address e, address vault) external onlyOwner {
+        engineVault[e] = vault;
+        emit EngineSet(e, vault);
     }
 
     /// @inheritdoc IClaimManager
     function registerClaim(address vault, address recipient, uint256 amount, uint64 deadline)
         external
         override
+        nonReentrant // audit L-1: defense-in-depth on the reserve path
         returns (uint256 id)
     {
-        if (!isEngine[msg.sender]) revert NotEngine();
+        address bound = engineVault[msg.sender];
+        if (bound == address(0)) revert NotEngine();
+        if (vault != bound) revert WrongVault(); // audit M-1: an engine can only touch its own vault
         if (recipient == address(0)) revert ZeroRecipient(); // audit L-1
         if (deadline <= block.timestamp) revert BadDeadline(); // audit L-1
         IVault(vault).reserve(amount); // reserves against free balance — reverts if insufficient
