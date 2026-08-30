@@ -236,6 +236,9 @@ Required steps not wired by `Deploy.s.sol`:
 6. Transfer all ownership to the **Timelock + multisig**; renounce where no further changes are expected. The
    tax hook has no owner, so nothing to transfer there. *(§2)*
 7. Verify the keeper is posting drand beacons on-chain before the first draw window closes.
+8. **QUOTRON gate check (§10, M-6/M-8 trust note):** confirm the four `BaseVault`s, `ClaimManager`, and
+   `Treasury` addresses/codehashes are not on QUOTRON's blacklist or `bannedVenueCodehash` list, and
+   confirm who controls QUOTRON's `paused`/blacklist (ideally timelocked) before relying on it for prizes.
 
 ---
 
@@ -271,7 +274,9 @@ config), or accepted with rationale.
 | **H-4** | High | **Operational, verified separately.** The EIP-2537 precompiles (`0x0b`/`0x0f`/`0x10`) were confirmed live on the actual Robinhood Chain RPC via a direct precompile probe during development (not inferred from `evm_version`), and the code is fail-closed if they were ever absent. Re-confirm on the final deploy target as a launch gate. |
 | **M-2** | Med | **Accepted / mitigated.** No trustworthy on-chain price reference exists (QPULL's only price is its own pool, so a TWAP is itself manipulable). Mitigated by the keeper gate (rotatable key) plus `maxConvertPerCall` **and now `maxWethConvertPerCall`**, which bound a single-slice sandwich; documented. |
 | **M-3** | Med | **Governance (§2)** — the timelock+multisig model is the resolution for re-settable bindings; the missing zero-check portion is fixed as L-5. |
-| **M-6, M-8** | Med | **Deployment preconditions on QUOTRON** (must not be fee-on-transfer; must not reduce a balance except via the holder's own outbound transfer). QUOTRON is a standard 18-decimal ERC-404; stated as a precondition pending its source / a live-fork verification pass. |
+| **M-6, M-8** | Med | **Verified against QUOTRON's source and resolved.** QUOTRON's verified source (`Quotron404V2`, 18 dec, on the RH Blockscout explorer) was read directly. **M-6 (fee-on-transfer): does not apply** — `_transfer` does `balanceOf[to] += amount` with no skim; recipients receive the full amount (reflections pay out in a separate stock token, never a cut of QUOTRON). **M-8 (external balance reduction): does not apply** — the whole-unit rebalance (`_syncDown`/`_syncUp`) mutates only the NFT layer (`_darkOwned`/`_ownerOf`/pool), **not** `balanceOf`, so third-party trading around a vault cannot reduce its fractional balance; `balanceOf` only decreases via the holder's own `_transfer`/`hardwire` (or QUOTRON-admin recovery — see the trust note). |
+
+**QUOTRON is a trusted, admin-controlled external dependency (learned from reading its source; not a code issue in this repo).** `Quotron404V2._checkTransferAllowed` gates every transfer on: a **`paused`** flag, a **blacklist** (`from`/`to`/`msg.sender`), a **`bannedVenueCodehash`** check (transfers revert if any party's contract codehash is banned — the four `BaseVault`s share one codehash), and an **`adminTransferTerminal`** recovery power that can move a whole unit out of any account. Prize *liveness* therefore depends on trusting QUOTRON's admin not to pause, blacklist, or ban-codehash the protocol's vaults / `ClaimManager` / winners. This is the same class as trusting QUOTRON to be a real prize token at all, and is surfaced here as an explicit assumption. **Launch check (added to §9):** confirm the protocol's vault / ClaimManager / Treasury addresses and codehashes are not on QUOTRON's blacklist or `bannedVenueCodehash` list, and understand who controls QUOTRON's pause/blacklist and whether it is timelocked.
 | **M-7** | Med | **Confirmed and addressed by cadence.** RH's `maxTimeVariation.delaySeconds` was read directly from its SequencerInbox on Ethereum L1 (`0xBd0D173EEb87D57A09521c24388a12789F33ba96` → `delaySeconds = 345_600 = 4 days`; `futureSeconds = 3_600 = 1h`). The sealed-then-revealed guarantee is code-enforced iff `REVEAL_LAG > delaySeconds`. **`REVEAL_LAG` is now sized per cadence: JackpotEngine = 5 days and HolderDrawEngine = 4.5 days — both exceed the 4-day bound, so the two highest-value randomized draws (jackpot winner-take-all; weekly holder draw) are fully code-enforced** even against a maximally back-dating sequencer (their 14-day / 7-day windows absorb the lag). The **daily raffle** (and per-cohort pack-tier reveal) structurally cannot set `REVEAL_LAG` above ~1 day, so those remain `1h` and rely on the standard trusted-sequencer assumption every Arbitrum L2 already requires; the residual is bounded (a daily bucket-split pot is far lower value than the jackpot, and the attack needs the RH-operated sequencer to catastrophically mis-stamp time — which breaks the whole chain, not just this raffle). |
 | **L-4** | Low | **Runbook** — do not `renounceOwnership` on contracts that need ongoing hot-key rotation (keeper) or before mandatory bindings are set; set bindings first. |
 | **L-6, L-7** | Low | **Owner-trust / accepted** — mint-recipient choice and `baseURI` mutability are owner responsibilities; on-chain rarity is immutable regardless. |
@@ -283,7 +288,8 @@ config), or accepted with rationale.
 ---
 
 *This remediation was prepared with AI assistance and is not a substitute for an independent human security
-review. A dedicated cryptographic review of `BlsDrandOracle`, a **V4-hook specialist review of
-`QpullTaxHook`**, and confirmation of **QUOTRON's ERC-404 semantics** remain recommended before mainnet.
-Robinhood Chain's EIP-2537 support and its sequencer `delaySeconds` (4 days) have been verified on-chain
-and are addressed above (H-4, M-7).*
+review. A dedicated cryptographic review of `BlsDrandOracle` and a **V4-hook specialist review of
+`QpullTaxHook`** remain recommended before mainnet. QUOTRON's ERC-404 semantics (M-6/M-8), Robinhood
+Chain's EIP-2537 support (H-4), and its sequencer `delaySeconds` (M-7) have all been verified on-chain /
+against source and are addressed above; the residual QUOTRON-admin trust surface is documented and gated
+by the §9 launch check.*
