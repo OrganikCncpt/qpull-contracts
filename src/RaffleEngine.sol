@@ -59,6 +59,7 @@ contract RaffleEngine is NonRenounceableOwnable2Step, ReentrancyGuard {
     // before the owner remembered to setPotCap. Excess over the cap rolls forward.
     uint256 public potCap;
     uint64 public lastPotAdjust; // audit M4 (job-745): timestamp of the last setPotCap (cooldown anchor)
+    uint64 public lastMinPotAdjust; // audit L-10 (pass-7): cooldown anchor for setMinPot
     mapping(uint32 => bool) public drawn;
 
     event WinnersPerDaySet(uint256 k);
@@ -115,6 +116,10 @@ contract RaffleEngine is NonRenounceableOwnable2Step, ReentrancyGuard {
     ///         Cross-checked against potCap (audit L-3): minPot > potCap would silently void every draw.
     function setMinPot(uint256 m) external onlyOwner {
         if (m == 0 || m > potCap) revert BadMinPot(); // audit F5: never 0, never above potCap
+        // audit L-10 (pass-7): rate-limited like setPotCap so an owner can't reactively slam minPot above a
+        // known winner's pot to force the void branch. Primary control remains the timelock+multisig migration.
+        if (block.timestamp < uint256(lastMinPotAdjust) + DAY) revert AdjustTooSoon();
+        lastMinPotAdjust = uint64(block.timestamp);
         minPot = m;
         emit MinPotSet(m);
     }

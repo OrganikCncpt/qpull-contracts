@@ -120,9 +120,11 @@ contract RaiseToLaunchTest is Test {
         vm.prank(alice);
         nft.mint{ value: MINT_PRICE }(); // alice becomes a holder
 
-        vm.deal(minter, (N - 1) * MINT_PRICE);
+        // pass-7: spread the raise across distinct wallets (NFTCollection caps mints at MAX_PER_WALLET = 5)
         for (uint256 i; i < N - 1; ++i) {
-            vm.prank(minter);
+            address m = address(uint160(uint256(uint160(minter)) + i + 1));
+            vm.deal(m, MINT_PRICE);
+            vm.prank(m);
             nft.mint{ value: MINT_PRICE }();
         }
         assertEq(nft.totalMinted(), N, "raise: N minted");

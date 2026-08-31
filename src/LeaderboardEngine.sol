@@ -36,6 +36,7 @@ contract LeaderboardEngine is NonRenounceableOwnable2Step, ReentrancyGuard {
     uint256 public potCap;
     uint256 public minPot; // audit C-1: floor below which distribute voids WITHOUT consuming the week
     uint64 public lastPotAdjust; // audit M4 (job-745): timestamp of the last setPotCap (cooldown anchor)
+    uint64 public lastMinPotAdjust; // audit L-10 (pass-7): cooldown anchor for setMinPot
     mapping(uint256 => bool) public distributed;
 
     event Distributed(uint256 indexed week, uint256 pot, uint256 winners);
@@ -93,6 +94,8 @@ contract LeaderboardEngine is NonRenounceableOwnable2Step, ReentrancyGuard {
     ///         Cross-checked against potCap (audit L-3): minPot > potCap would silently void every week.
     function setMinPot(uint256 m) external onlyOwner {
         if (m == 0 || m > potCap) revert BadMinPot(); // audit F5: never 0, never above potCap
+        if (block.timestamp < uint256(lastMinPotAdjust) + WEEK) revert AdjustTooSoon(); // audit L-10 (pass-7)
+        lastMinPotAdjust = uint64(block.timestamp);
         minPot = m;
         emit MinPotSet(m);
     }

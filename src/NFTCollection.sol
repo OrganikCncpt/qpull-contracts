@@ -25,6 +25,7 @@ contract NFTCollection is INFTCollection, ERC721, Ownable2Step, ReentrancyGuard 
     uint8 internal constant SUPER_RARE = 3;
 
     uint256 public constant MAX_SUPPLY = 250;
+    uint256 public constant MAX_PER_WALLET = 5; // pass-7: cap mints per wallet for fairer distribution
     uint256 internal constant BPS = 10_000;
     uint256 public constant LP_BPS = 8000; // 80%
     uint256 public constant SEED_BPS = 1500; // 15%
@@ -35,6 +36,7 @@ contract NFTCollection is INFTCollection, ERC721, Ownable2Step, ReentrancyGuard 
     uint256 public immutable revealDelay;
 
     uint256 public totalMinted;
+    mapping(address => uint256) public mintedBy; // pass-7: per-wallet mint count, capped at MAX_PER_WALLET
     uint64 public revealRound; // ONE round sealing ALL rarities — set at finalizeLaunch (quantized for BLS)
 
     uint256 public lpReserve;
@@ -56,6 +58,7 @@ contract NFTCollection is INFTCollection, ERC721, Ownable2Step, ReentrancyGuard 
 
     error MintClosed();
     error SoldOut();
+    error WalletLimit();
     error BadPrice();
     error AlreadyLaunched();
     error AlreadyMinting();
@@ -107,8 +110,10 @@ contract NFTCollection is INFTCollection, ERC721, Ownable2Step, ReentrancyGuard 
             revert RecipientsUnset();
         }
         if (totalMinted >= MAX_SUPPLY) revert SoldOut();
+        if (mintedBy[msg.sender] >= MAX_PER_WALLET) revert WalletLimit(); // pass-7: per-wallet cap
         if (msg.value != mintPrice) revert BadPrice();
 
+        mintedBy[msg.sender] += 1; // pass-7
         uint256 id = ++totalMinted; // ids 1..250 (rarity is sealed collection-wide at finalizeLaunch)
 
         // Split 80/15/5. Team is the EXACT 5%; LP absorbs any rounding dust so team is never > 5% (audit L-17).

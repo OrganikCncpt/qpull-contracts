@@ -1,6 +1,7 @@
 # QPULL — Audit Remediation & Security Model
 
-This document tracks the external AI audits of `qpull-contracts` across five passes:
+This document tracks the external AI audits of `qpull-contracts` across seven passes (pass 6 in **§13**, the
+latest 3-phase multi-agent pass in **§14**):
 
 - **Pass 1** (commit `47d9c4f`, 20H/24M/17L) — remediation in §§1–5.
 - **Pass 2 / job 737** (commit `6dd4dec`, 1C/8H/18M) — remediation in **§7**.
@@ -439,6 +440,37 @@ remediation (was 179). New regression tests: `test_M3_*`, `test_M4_*`, `test_L1_
 *Residual pre-mainnet recommendations are unchanged: a dedicated cryptographic review of `BlsDrandOracle`
 and a **V4-hook specialist review of `QpullTaxHook`** — the latter also being the artifact a Uniswap-interface
 hook-allowlist submission would require.*
+
+---
+
+## 14. Seventh pass — independent 3-phase multi-agent audit (commit `a428ef4`) — 0C / 0H / 4M / 12L / 17I
+
+An independent three-phase pipeline (context → 8 breadth agents → 12 attacker-mindset agents → synthesis) on
+the pushed pass-6 code. **No Critical, no High.** Most findings independently re-confirmed residuals we had
+already documented; three were genuinely new — one a real flaw in the pass-6 M3 convert fix.
+
+### Fixed in code (pass-7)
+| # | Sev | Finding & fix |
+|---|-----|---------------|
+| **M-2** | Med | `convert()`'s M3 blacklist-isolation retried a stuck vault's QUOTRON slice via the next call's FULL-balance split, redistributing ~92% of it to the sibling games. **Fix:** a per-vault `quotronOwed` ledger — a failed send is credited to that vault and retried ONLY to it (`_trySendQuotron` folds each vault's own `owed` back in; the split now applies to `splittable` = balance − owed). Stuck slices reach their own game, never siblings. |
+| **L-10** | Low | `setMinPot` was the unguarded twin of the rate-limited `setPotCap` — an owner could slam `minPot` above a known winner's pot to force the void branch. **Fix:** `setMinPot` now carries the same per-engine cooldown (`lastMinPotAdjust`) on all four engines. |
+| **L-11** | Low | `HolderDrawEngine.setExcluded` NatSpec had two contradictory blocks (one describing a mid-snapshot guard removed in the atomic-snapshot redesign). **Fix:** one accurate block; documents that exclusion only affects weeks whose snapshot hasn't run. |
+| **L-2** | Low | Sub-25-unit dust swaps round the 4% fee to 0 yet earned game credit. **Fix:** game-registry credit gated on `fee > 0` (kept the round-DOWN so the exact-4% invariant holds). |
+| **new** | feat | `NFTCollection`: `MAX_PER_WALLET = 5` per-wallet mint cap (`mintedBy` tracking + `WalletLimit`) for fairer distribution. |
+
+### Accepted / documented (no code change)
+| # | Sev | Disposition |
+|---|-----|-------------|
+| **M-1** | Med | Daily-raffle/tier/rarity reveal-lag (1h) can't exceed RH's 4-day sequencer back-date bound (daily cadence needs a same-following-day window) — trusted-sequencer residual (= our M-7/F4). Jackpot (5d)/HolderDraw (4.5d) exceed it, code-enforced. |
+| **M-3** | Med | `convert()` off-chain slippage + never-lockable keeper = our keeper-trust (M-2); bounded by `maxConvertPerCall`, mitigated by the timelock migration. |
+| **M-4** | Med | Pre-migration EOA-owner window could cement a bad config — resolved by transferring ownership to the timelock+multisig *before* setting/locking bindings (runbook). |
+| **L-6** | Low | Conversion sizing knobs intentionally NOT frozen by `lockRouting` — tuned to pool depth at go-live and may need ongoing tuning; owner-griefing is bounded/reversible, mitigated by the timelock. |
+| **L-8** | Low | `runDraw` reverting on an un-posted cohort tier beacon is fail-closed + retryable (no tickets consumed); a "skip" would consume the ticket for no payout. Keeper (`prep-draw.js`) posts all in-window beacons first. |
+| **L-12** | Low | `HolderDrawEngine` has no on-chain registry peer to constructor-cross-check `genesis`; cross-checked at deploy (`Deploy` asserts `HolderDraw.genesis() == Raffle.genesis()`, pass-6 L4). |
+| **L-1/L-3/L-5** | Low | HolderDraw flash-hold (=H-5/F8), QUOTRON freeze no-rescue (=F3/L6), immutable oracle (=L5) — prior accepted residuals. |
+| L-4/L-7/L-9/I* | Low/Info | Adapter on-chain deadline (backstopped by `minOut`), renounce-before-wiring ordering (runbook), jackpot rollover-farming (Lead, needs live-data), + informationals — accepted/documented. |
+
+*Local suite: **188 tests green** after pass-7 (+ regression tests: M-2 own-vault retry, L-10 cooldown, per-wallet cap). Two co-requested features — the NFT standing-entry model (Option B) and a first-hour buy cap+cooldown — are **deferred** to a separate pass: they materially change the raffle-draw / hook-swap paths and warrant dedicated design + test work, not a rushed pre-audit change.*
 
 ---
 

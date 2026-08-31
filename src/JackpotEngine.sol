@@ -49,6 +49,7 @@ contract JackpotEngine is NonRenounceableOwnable2Step, ReentrancyGuard {
     uint256 internal constant REVEAL_LAG = 5 days;
 
     uint64 public lastPotAdjust; // audit M4 (job-745): timestamp of the last setPotCap (cooldown anchor)
+    uint64 public lastMinPotAdjust; // audit L-10 (pass-7): cooldown anchor for setMinPot
     mapping(uint256 => bool) public drawn;
 
     event DrawExecuted(uint256 indexed period, uint256 pot, address indexed winner);
@@ -105,6 +106,8 @@ contract JackpotEngine is NonRenounceableOwnable2Step, ReentrancyGuard {
     ///         Must stay > 0 and <= potCap (audit H-2/L-3).
     function setMinPot(uint256 m) external onlyOwner {
         if (m == 0 || m > potCap) revert BadMinPot();
+        if (block.timestamp < uint256(lastMinPotAdjust) + PERIOD) revert AdjustTooSoon(); // audit L-10 (pass-7)
+        lastMinPotAdjust = uint64(block.timestamp);
         minPot = m;
         emit MinPotSet(m);
     }

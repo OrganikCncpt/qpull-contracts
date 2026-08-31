@@ -277,7 +277,7 @@ contract QpullTaxHook is ReentrancyGuardTransient {
         // Game notifications (spec §4/§10/§11), credited to the signer. try/catch: an immutable hook
         // must never let a registry fault brick the canonical pool — a failed record costs only that
         // trade's rewards and is surfaced via RecordFailed.
-        if (grossQpull > 0) {
+        if (grossQpull > 0 && fee > 0) { // audit L-2 (pass-7): a zero-tax (sub-25-unit dust) swap earns no game credit
             if (isBuy) {
                 try packRegistry.recordBuy(tx.origin, grossQpull) { }
                 catch {

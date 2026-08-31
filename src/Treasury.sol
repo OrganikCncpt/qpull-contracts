@@ -54,6 +54,7 @@ contract Treasury is NonRenounceableOwnable2Step, ReentrancyGuard, IERC721Receiv
     // uncapped; owner sets a pool-sized ceiling at launch and the keeper drains the excess over several calls.
     uint256 public maxWethConvertPerCall = type(uint256).max;
     mapping(address => bool) public isKeeper; // only an authorized keeper may trigger convert()
+    mapping(address => uint256) public quotronOwed; // M-2 (pass-7): QUOTRON stuck on a failed vault send, retried to THAT vault
 
     // audit F2 (pass-5): setRouting sets convert()'s unconditional payout destinations (the three prize
     // vaults + the 20% team cut). It was freely re-settable, so a compromised owner could redirect ALL
@@ -140,6 +141,9 @@ contract Treasury is NonRenounceableOwnable2Step, ReentrancyGuard, IERC721Receiv
     }
 
     function setConvertThreshold(uint256 t) external onlyOwner {
+        // L-6 (pass-7): intentionally NOT frozen by lockRouting — pool-sized conversion limits are tuned at
+        // go-live (after the pool exists) and may need ongoing tuning; the owner-griefing risk is bounded and
+        // reversible, and mitigated by the timelock+multisig owner migration (see SECURITY.md).
         convertThreshold = t;
         emit ConvertThresholdSet(t);
     }
@@ -225,18 +229,22 @@ contract Treasury is NonRenounceableOwnable2Step, ReentrancyGuard, IERC721Receiv
         uint256 qOut = quotron.balanceOf(address(this)) - qBefore; // THIS-swap delta — the floor check keys on it
         if (qOut < minQuotronOut) revert SwapShortfall();
 
-        // 4. split the FULL held QUOTRON across the prize vaults (of the 8000 prize bps). audit M3 (job-745):
-        //    the three sends are per-vault ISOLATED (best-effort) so a QUOTRON per-address blacklist of ONE
-        //    vault can no longer revert the whole convert() and starve the other two + the team/QPULL legs.
-        //    A blacklisted vault's slice simply stays in the Treasury and rides the NEXT call's full-balance
-        //    split (qBal = qBefore + qOut), so it retries automatically and is never permanently stranded.
-        //    (This does NOT defend the shared-codehash bannedVenueCodehash ban or a global QUOTRON pause,
-        //    which hit all four vaults at once — an accepted external-admin trust boundary; see SECURITY.md.)
-        //    Zero-value legs are skipped (audit M-5): a thin batch floors toJackpot/toLeaderboard to 0.
+        // 4. Split the NEWLY-CONVERTED QUOTRON across the prize vaults (of the 8000 prize bps). The three sends
+        //    are per-vault ISOLATED (best-effort) so a QUOTRON per-address blacklist of ONE vault can no longer
+        //    revert the whole convert() and starve the other two + the team/QPULL legs. audit M-2 (pass-7): a
+        //    failed send is credited to quotronOwed[vault] and retried ONLY to that same vault on the next
+        //    convert() — so a stuck slice is never silently redistributed to its sibling games (the earlier
+        //    "rides the next full-balance split" behaviour leaked ~92% of a stuck slice to the wrong vaults).
+        //    We therefore split only `splittable` (balance minus already-owed), and _trySendQuotron folds each
+        //    vault's own owed back in. (This does NOT defend the shared-codehash bannedVenueCodehash ban or a
+        //    global QUOTRON pause, which hit all four vaults at once — an accepted external-admin trust boundary;
+        //    see SECURITY.md.) Zero-value legs are skipped (audit M-5): a thin batch floors the small legs to 0.
         uint256 qBal = quotron.balanceOf(address(this));
-        uint256 toJackpot = (qBal * JACKPOT_BPS) / PRIZE_BPS;
-        uint256 toLeaderboard = (qBal * LEADERBOARD_BPS) / PRIZE_BPS;
-        uint256 toHourly = qBal - toJackpot - toLeaderboard;
+        uint256 owedTotal = quotronOwed[prizeVault] + quotronOwed[jackpotVault] + quotronOwed[leaderboardVault];
+        uint256 splittable = qBal > owedTotal ? qBal - owedTotal : 0; // only the fresh conversion is split by ratio
+        uint256 toJackpot = (splittable * JACKPOT_BPS) / PRIZE_BPS;
+        uint256 toLeaderboard = (splittable * LEADERBOARD_BPS) / PRIZE_BPS;
+        uint256 toHourly = splittable - toJackpot - toLeaderboard;
         _trySendQuotron(prizeVault, toHourly);
         _trySendQuotron(jackpotVault, toJackpot);
         _trySendQuotron(leaderboardVault, toLeaderboard);
@@ -244,16 +252,18 @@ contract Treasury is NonRenounceableOwnable2Step, ReentrancyGuard, IERC721Receiv
         emit Converted(qpullIn, wethOut, qOut, teamWeth);
     }
 
-    /// @dev audit M3 (job-745): best-effort QUOTRON send. A per-address-blacklisted recipient must not brick
-    ///      the whole convert() — its slice stays in the Treasury and drains on the next call's full-balance
-    ///      split. Self-correcting: no "distributed" state is tracked; balanceOf is re-read each call, so even
-    ///      a token that returns false (rather than reverting) cannot desync accounting. Reentrancy-safe:
-    ///      convert() is nonReentrant, this is its LAST step (no state writes after), and real QUOTRON
-    ///      auto-exempts contract recipients from the ERC-404 receiver callback.
+    /// @dev audit M-2 (pass-7): best-effort QUOTRON send that retries to the SAME vault. Sends `amount` PLUS any
+    ///      previously-owed slice for `to` (a prior blacklisted send); on failure the whole total is re-credited
+    ///      to quotronOwed[to], so a stuck vault's funds always retry to IT — never redistributed to siblings
+    ///      (the M-2 fix). A per-address-blacklisted recipient thus can't brick convert() OR misallocate its
+    ///      game's funding. Reentrancy-safe: convert() is nonReentrant, these sends are its LAST step (nothing
+    ///      runs after them), and real QUOTRON auto-exempts contract recipients from the ERC-404 callback.
     function _trySendQuotron(address to, uint256 amount) private {
-        if (amount == 0) return; // preserves the M-5 zero-value skip
-        (bool ok,) = address(quotron).call(abi.encodeCall(IERC20.transfer, (to, amount)));
-        ok; // deliberately ignored: on failure the slice simply stays in the Treasury balance
+        uint256 total = amount + quotronOwed[to];
+        if (total == 0) return; // preserves the M-5 zero-value skip
+        quotronOwed[to] = 0; // clear first; re-set below if the send still fails
+        (bool ok,) = address(quotron).call(abi.encodeCall(IERC20.transfer, (to, total)));
+        if (!ok) quotronOwed[to] = total; // still blocked: owe the full slice to THIS vault, retry next convert
     }
 
     /// @notice ERC-404 terminal-mint safety (§13.3), defense-in-depth. A convert() batch that buys ≥1

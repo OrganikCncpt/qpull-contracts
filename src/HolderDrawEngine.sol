@@ -53,6 +53,7 @@ contract HolderDrawEngine is NonRenounceableOwnable2Step, ReentrancyGuard {
 
     uint256 public potCap; // owner re-pegs within bounds; clamped by POT_CAP_CEILING
     uint64 public lastPotAdjust;
+    uint64 public lastMinPotAdjust; // audit L-10 (pass-7): cooldown anchor for setMinPot
     // MINIMUM pot below which a draw voids WITHOUT consuming the week — closes the dust-donation grief where
     // anyone raises freeBalance() by a few wei to force a near-zero payout that burns the week (audit C-1).
     // REQUIRED (> 0) at construction (audit H-2): the only config-independent guard here is pot/WINNERS==0
@@ -262,17 +263,17 @@ contract HolderDrawEngine is NonRenounceableOwnable2Step, ReentrancyGuard {
     ///         Must stay > 0 and <= potCap (audit H-2/L-3).
     function setMinPot(uint256 m) external onlyOwner {
         if (m == 0 || m > potCap) revert BadMinPot();
+        if (block.timestamp < uint256(lastMinPotAdjust) + WEEK) revert AdjustTooSoon(); // audit L-10 (pass-7)
+        lastMinPotAdjust = uint64(block.timestamp);
         minPot = m;
         emit MinPotSet(m);
     }
 
-    /// @notice Bar an address (protocol/escrow) from winning. Forbidden while the CURRENT week's snapshot is
-    ///         partway done (audit M-4): exclusion is frozen per-token as each chunk runs, so a mid-snapshot
-    ///         change would freeze an internally-inconsistent owner set (some of the account's tokens captured
-    ///         as owner, others as address(0)). Change it before the snapshot starts or after it completes.
-    /// @notice Bar an address (protocol/escrow) from winning. Exclusion is read atomically inside the
-    ///         single-tx snapshot (audit F3), so it can no longer be applied inconsistently mid-scan — the
-    ///         old mid-snapshot guard (and its griefing vector) are gone with the chunked snapshot.
+    /// @notice Bar an address (protocol/escrow) from winning. Exclusion is read atomically inside the single-tx
+    ///         snapshot (audit F3), so it can never be applied inconsistently mid-scan (the old chunked-snapshot
+    ///         mid-scan guard and its griefing vector are gone). audit L-11 (pass-7): exclusion only affects
+    ///         weeks whose snapshot has NOT yet run — set after a week's snapshot it has no effect on that
+    ///         week's draw (eligibility is frozen at snapshot time). Owner-gated.
     function setExcluded(address account, bool v) external onlyOwner {
         excluded[account] = v;
         emit ExcludedSet(account, v);
