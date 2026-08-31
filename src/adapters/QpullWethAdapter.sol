@@ -144,7 +144,9 @@ contract QpullWethAdapter is ISwapAdapter, IUnlockCallback, Ownable2Step, Reentr
         // amountIn. On a partial fill (pool liquidity exhausted at the price-limit sentinel) V4 takes less than
         // amountIn; settling the nominal would leave a positive delta and revert unlock() with CurrencyNotSettled.
         int128 in128 = zeroForOne ? delta.amount0() : delta.amount1(); // negative = QPULL owed to the pool
-        uint256 consumed = uint256(uint128(-in128));
+        // audit L7 (job-745): promote to int256 BEFORE negating so type(int128).min can't overflow (matches
+        // the hook's own _abs idiom). Numerically identical for all reachable fills.
+        uint256 consumed = uint256(-int256(in128));
 
         // Pay QPULL in: sync, transfer the consumed amount, settle.
         poolManager.sync(Currency.wrap(qpull));

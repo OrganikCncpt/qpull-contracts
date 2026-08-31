@@ -24,6 +24,8 @@ contract JackpotEngine is NonRenounceableOwnable2Step, ReentrancyGuard {
 
     uint256 public constant PERIOD = 14 days;
     uint256 public constant CLAIM_WINDOW = 30 days;
+    uint256 internal constant BPS = 10_000;
+    uint256 internal constant MAX_ADJ_BPS = 2500; // audit M4 (job-745): potCap re-peg bounded to +/-25%/period
     // Owner-set bound on a single draw's payout (audit H-3B/M-9). audit F14 (pass-5): REQUIRED (> 0) at
     // construction now (no fail-open type(uint256).max default) — caps how much a delaying known-winner can
     // absorb from the next period, and keeps a single QUOTRON prize within one-transfer gas. Excess rolls
@@ -46,6 +48,7 @@ contract JackpotEngine is NonRenounceableOwnable2Step, ReentrancyGuard {
     // M-7 for the jackpot — the highest-value target (winner-take-all).
     uint256 internal constant REVEAL_LAG = 5 days;
 
+    uint64 public lastPotAdjust; // audit M4 (job-745): timestamp of the last setPotCap (cooldown anchor)
     mapping(uint256 => bool) public drawn;
 
     event DrawExecuted(uint256 indexed period, uint256 pot, address indexed winner);
@@ -57,6 +60,8 @@ contract JackpotEngine is NonRenounceableOwnable2Step, ReentrancyGuard {
     error BadPotCap();
     error BadMinPot();
     error GenesisMismatch();
+    error AdjustTooSoon(); // audit M4 (job-745)
+    error AdjustOutOfBounds(); // audit M4 (job-745)
 
     constructor(
         address drand_,
@@ -83,8 +88,15 @@ contract JackpotEngine is NonRenounceableOwnable2Step, ReentrancyGuard {
     }
 
     /// @notice Bound a single draw's payout (audit H-3B/M-9). Never below the minPot floor (audit L-3).
+    /// @dev    audit M4 (job-745): rate-limited to +/-25% per 14-day period (one change per period), so an
+    ///         owner cannot front-run a determined draw to shrink a known winner's prize.
     function setPotCap(uint256 c) external onlyOwner {
         if (c == 0 || c < minPot) revert BadPotCap();
+        if (block.timestamp < uint256(lastPotAdjust) + PERIOD) revert AdjustTooSoon();
+        uint256 lo = (potCap * (BPS - MAX_ADJ_BPS)) / BPS;
+        uint256 hi = (potCap * (BPS + MAX_ADJ_BPS)) / BPS;
+        if (c < lo || c > hi) revert AdjustOutOfBounds();
+        lastPotAdjust = uint64(block.timestamp);
         potCap = c;
         emit PotCapSet(c);
     }

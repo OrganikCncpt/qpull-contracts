@@ -35,7 +35,7 @@ import { MockDrandOracle } from "./mocks/MockDrandOracle.sol";
 ///         swap shapes, first-hour gate, exemption, registry fan-out + try/catch, pool-creation
 ///         control, and the adapter's hooked-pool binding.
 contract QpullTaxHookTest is Test {
-    uint160 constant FLAGS = (1 << 12) | (1 << 11) | (1 << 6) | (1 << 2); // +beforeAddLiquidity (0x1844)
+    uint160 constant FLAGS = (1 << 12) | (1 << 11) | (1 << 9) | (1 << 6) | (1 << 2); // add+remove LP gate (0x1A44)
     uint160 constant SQRT_1_1 = 79_228_162_514_264_337_593_543_950_336; // 1:1
     uint160 constant MIN_PRICE_P1 = 4_295_128_739 + 1;
     uint160 constant MAX_PRICE_M1 = 1_461_446_703_485_210_103_287_273_052_203_988_822_378_723_970_342 - 1;
@@ -227,6 +227,23 @@ contract QpullTaxHookTest is Test {
         weth.approve(address(liqRouter), type(uint256).max);
         vm.prank(address(this), address(this));
         liqRouter.modifyLiquidity(key, IV4PoolManager.ModifyLiquidityParams(FULL_LO, FULL_HI, 1e23, 0), "");
+    }
+
+    // audit L1 (job-745): removal is gated symmetrically to add — a third party cannot pull protocol
+    // liquidity out of the canonical pool (beforeRemoveLiquidity applies the same initializer gate).
+    function test_L1_nonInitializerCannotRemoveLiquidity() public {
+        // setUp already seeded LP as the initializer; a stranger attempting a withdrawal hits the gate.
+        address stranger = makeAddr("lpRemover");
+        vm.startPrank(stranger, stranger); // msg.sender AND tx.origin = stranger (not the initializer)
+        vm.expectRevert(); // LiquidityRestricted, wrapped by v4-core's hook-revert bubbling
+        liqRouter.modifyLiquidity(key, IV4PoolManager.ModifyLiquidityParams(FULL_LO, FULL_HI, -1e23, 0), "");
+        vm.stopPrank();
+    }
+
+    function test_L1_initializerCanRemoveLiquidity() public {
+        // the protocol (initializer == this) withdraws its own seeded liquidity — tx.origin == initializer
+        vm.prank(address(this), address(this));
+        liqRouter.modifyLiquidity(key, IV4PoolManager.ModifyLiquidityParams(FULL_LO, FULL_HI, -1e23, 0), "");
     }
 
     function test_initializeFrontRunBlocked() public {

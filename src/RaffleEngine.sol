@@ -44,6 +44,7 @@ contract RaffleEngine is NonRenounceableOwnable2Step, ReentrancyGuard {
     uint256 internal constant REVEAL_LAG = 1 hours;
     uint256 public constant MAX_K = 200; // audit M-3: one-block-safe (was 1000; ~120-140k gas/winner)
     uint256 internal constant BPS = 10_000;
+    uint256 internal constant MAX_ADJ_BPS = 2500; // audit M4 (job-745): potCap re-peg bounded to +/-25%/cooldown
 
     uint256 public winnersPerDay; // K
     // Owner-set MINIMUM pot below which a draw voids WITHOUT consuming the day or burning tickets — closes
@@ -57,6 +58,7 @@ contract RaffleEngine is NonRenounceableOwnable2Step, ReentrancyGuard {
     // type(uint256).max fail-open default that let a sole entrant capture a whole rolled-forward balance
     // before the owner remembered to setPotCap. Excess over the cap rolls forward.
     uint256 public potCap;
+    uint64 public lastPotAdjust; // audit M4 (job-745): timestamp of the last setPotCap (cooldown anchor)
     mapping(uint32 => bool) public drawn;
 
     event WinnersPerDaySet(uint256 k);
@@ -71,6 +73,8 @@ contract RaffleEngine is NonRenounceableOwnable2Step, ReentrancyGuard {
     error GenesisMismatch();
     error BadPotCap();
     error BadMinPot(); // audit F5
+    error AdjustTooSoon(); // audit M4 (job-745)
+    error AdjustOutOfBounds(); // audit M4 (job-745)
 
     constructor(
         address drand_,
@@ -116,8 +120,16 @@ contract RaffleEngine is NonRenounceableOwnable2Step, ReentrancyGuard {
     }
 
     /// @notice Bound a single day's payout (audit H-3). Excess over the cap rolls forward.
+    /// @dev    audit M4 (job-745): rate-limited to +/-25% per draw-day and one change per day (matching
+    ///         HolderDrawEngine), so an owner can no longer front-run a determined draw and slam potCap to
+    ///         minPot to shrink a known winner's prize. Larger moves take several days.
     function setPotCap(uint256 c) external onlyOwner {
-        if (c == 0 || c < minPot) revert BadPotCap(); // audit L-3: never below the minPot floor
+        if (c == 0 || c < minPot) revert BadPotCap(); // audit L-3: never below the minPot floor (checked first)
+        if (block.timestamp < uint256(lastPotAdjust) + DAY) revert AdjustTooSoon();
+        uint256 lo = (potCap * (BPS - MAX_ADJ_BPS)) / BPS;
+        uint256 hi = (potCap * (BPS + MAX_ADJ_BPS)) / BPS;
+        if (c < lo || c > hi) revert AdjustOutOfBounds();
+        lastPotAdjust = uint64(block.timestamp);
         potCap = c;
         emit PotCapSet(c);
     }

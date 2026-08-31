@@ -57,6 +57,8 @@ contract ClaimManager is IClaimManager, Ownable2Step, ReentrancyGuard {
     error BadDeadline();
     error NotRegistered();
     error EnginesAlreadyLocked(); // audit F1 (pass-5)
+    error OnlySelf(); // audit L5 (job-745): settleSelf is an internal self-call only
+    error IncompleteBindings(); // audit L2 (job-745): lockEngines refuses an incomplete engine map
 
     constructor(address initialOwner) Ownable(initialOwner) { }
 
@@ -70,10 +72,18 @@ contract ClaimManager is IClaimManager, Ownable2Step, ReentrancyGuard {
     }
 
     /// @notice One-way, irreversible: freeze the engine<->vault bindings forever (audit F1, pass-5). Called
-    ///         once by the owner after all four engines are wired and verified at launch. After this, no
-    ///         owner (or compromised owner key) can rebind an engine to drain a vault's free balance — the
-    ///         same immutability BaseVault.controller already has, extended to ClaimManager's delegated map.
-    function lockEngines() external onlyOwner {
+    ///         once by the owner after all engines are wired and verified at launch. After this, no owner (or
+    ///         compromised owner key) can rebind an engine to drain a vault's free balance — the same
+    ///         immutability BaseVault.controller already has, extended to ClaimManager's delegated map.
+    /// @dev    audit L2 (job-745): the caller passes the EXACT expected (engine, vault) pairs and each is
+    ///         verified live before the freeze — so a lock issued before wiring is complete reverts instead
+    ///         of permanently bricking an unbound game's registerClaim.
+    function lockEngines(address[] calldata engines, address[] calldata vaults) external onlyOwner {
+        uint256 n = engines.length;
+        if (n == 0 || n != vaults.length) revert IncompleteBindings();
+        for (uint256 i; i < n; ++i) {
+            if (vaults[i] == address(0) || engineVault[engines[i]] != vaults[i]) revert IncompleteBindings();
+        }
         enginesLocked = true;
         emit EnginesLocked();
     }
@@ -101,30 +111,43 @@ contract ClaimManager is IClaimManager, Ownable2Step, ReentrancyGuard {
         if (c.settled) revert AlreadySettled();
         if (msg.sender != c.recipient) revert NotRecipient();
         if (block.timestamp > c.deadline) revert Expired();
-        _settleAndPay(id, c);
+        _settle(id, c); // single claim: a failed payout reverts (the caller wants to know)
     }
 
     /// @notice Claim MANY prizes in one transaction (the "claim all" path). An id that is not the caller's,
     ///         already settled, or past its 30-day window is SKIPPED — never reverted — so a single stale id
-    ///         can't brick the whole batch. Only the caller's own claims are ever paid (recipient check is
-    ///         enforced per id), and each still runs full CEI. Returns how many were actually paid; the
-    ///         caller sizes `ids` to stay within the block gas limit.
+    ///         can't brick the whole batch. audit L5 (job-745): a claim whose PAYOUT reverts (its vault
+    ///         paused/blacklisted by QUOTRON) is also skipped — the failed settleSelf() self-call reverts
+    ///         atomically, rolling back its `settled`/`release`, so that claim stays unsettled + reserved
+    ///         (retryable via single claim()), while the caller's OTHER healthy claims still pay. Only the
+    ///         caller's own claims are ever paid. Returns how many were actually paid.
     function claimBatch(uint256[] calldata ids) external nonReentrant returns (uint256 claimed) {
         uint256 n = ids.length;
         for (uint256 i; i < n; ++i) {
             uint256 id = ids[i];
             Claim storage c = claims[id];
             if (c.settled || msg.sender != c.recipient || block.timestamp > c.deadline) continue;
-            _settleAndPay(id, c);
-            unchecked {
-                ++claimed;
+            try this.settleSelf(id) {
+                unchecked {
+                    ++claimed;
+                }
+            } catch {
+                // payout reverted (e.g. a QUOTRON-blacklisted vault): leave the claim unsettled+reserved, skip
             }
         }
     }
 
-    /// @dev Effects-before-interactions: mark settled, release the reserve, then pay out. nonReentrant on the
-    ///      external entrypoints backs up CEI against an ERC-404 receiver-hook reentry.
-    function _settleAndPay(uint256 id, Claim storage c) private {
+    /// @dev External self-only wrapper so claimBatch can `try/catch` a reverting payout. MUST NOT be
+    ///      nonReentrant: the parent (claim/claimBatch) is already ENTERED, so a nonReentrant modifier here
+    ///      would make every self-call revert. Reentrancy is still fully covered — the external entrypoints
+    ///      carry the guard and this does not reset it, so an ERC-404 receiver-hook re-entry still reverts.
+    function settleSelf(uint256 id) external {
+        if (msg.sender != address(this)) revert OnlySelf();
+        _settle(id, claims[id]);
+    }
+
+    /// @dev Effects-before-interactions: mark settled, release the reserve, then pay out.
+    function _settle(uint256 id, Claim storage c) private {
         c.settled = true;
         IVault(c.vault).release(c.amount);
         IVault(c.vault).payOut(c.recipient, c.amount);

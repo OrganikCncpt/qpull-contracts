@@ -76,6 +76,11 @@ contract BlsDrandOracle is IDrandOracle {
         if (!okAdd || addOut.length != 128) revert PrecompileUnavailable();
         (bool okPair, bytes memory pairOut) = BLS_PAIRING.staticcall(new bytes(384));
         if (!okPair || pairOut.length != 32 || pairOut[31] != 0x01) revert PrecompileUnavailable();
+        // audit L9 (job-745): also probe MAP_FP_TO_G1 (0x10) — used by _hashToG1 on the submitBeacon path, so
+        // a chain with G1ADD+PAIRING but not MAP_FP_TO_G1 would pass the gate yet fail every draw. 64 zero
+        // bytes = the Fp encoding of 0 (a valid field element); map_to_curve is total -> a 128-byte G1 point.
+        (bool okMap, bytes memory mapOut) = BLS_MAP_FP_TO_G1.staticcall(new bytes(64));
+        if (!okMap || mapOut.length != 128) revert PrecompileUnavailable();
     }
 
     /// @notice Permissionless: submit round `round`'s uncompressed (128-byte) drand signature. Stores

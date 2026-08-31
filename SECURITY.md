@@ -14,6 +14,11 @@ This document tracks the external AI audits of `qpull-contracts` across five pas
   code-fixable finding is fixed (local suite: **179 tests green**), including the previously-open LP/tax gap
   (pass-4 F4 / pass-5 F6): **liquidity provision is now restricted to the protocol** (hook re-mined to
   `0x1844` with a `beforeAddLiquidity` gate).
+- **Pass 6, an independent audit** (commit `24a36cc`, 0C/0H/4M/12L/15I) — remediation in **§13**. No Critical
+  or High. Every code-fixable finding is fixed (local suite: **186 tests green**): convert() no longer bricks
+  if one prize vault is QUOTRON-blacklisted (M3), pot-cap re-pegs are rate-limited to ±25%/cooldown (M4),
+  the LP gate now also covers **remove** (L1, hook re-mined `0x1844`→`0x1A44`), and `claimBatch` survives a
+  single reverting payout (L5).
 
 Every High/Medium/Low finding is mapped below to one of: **fixed in code**, **resolved by governance**,
 **accepted (bounded)**, **removed**, or **false positive**. The local test suite is green after all code
@@ -400,10 +405,48 @@ this pass — restrict LP to the protocol — so it is in **Fixed in code**, not
 
 ---
 
+## 13. Sixth pass — independent audit (job 745, commit `24a36cc`) — 0C / 0H / 4M / 12L / 15I
+
+No Critical and no High. Every code-fixable finding is fixed; the local suite is **186 tests green** after
+remediation (was 179). New regression tests: `test_M3_*`, `test_M4_*`, `test_L1_*`, `test_L2_*`, `test_L3_*`,
+`test_L5_*`, plus mocks `MockBlacklistERC20` and `MockRevertOnAmountERC20`.
+
+### Fixed in code
+
+| # | Sev | Finding & fix |
+|---|-----|---------------|
+| **M3** | Med | `Treasury.convert()` split the prize QUOTRON with three `safeTransfer`s — if QUOTRON **blacklisted any one prize vault**, the whole conversion reverted and *all* prize routing bricked. **Fix:** each leg now goes through `_trySendQuotron` (a low-level `call` that swallows a failed transfer), and the split is taken on the **full** QUOTRON balance (`qBal`), not the swap delta — so a stuck slice stays in the Treasury and is **auto-retried on the next convert()**, never lost. The `minQuotronOut` floor still keys on the this-swap delta. |
+| **M4** | Med | `setPotCap` let the owner re-peg a single day's payout arbitrarily in one tx (a compromised-owner inflate/deflate lever). **Fix:** re-pegs are bounded to **±25% per cooldown** (`MAX_ADJ_BPS = 2500`; cooldown = DAY raffle / 14d jackpot / 7d leaderboard), via `lastPotAdjust` + errors `AdjustTooSoon` / `AdjustOutOfBounds`. `BadPotCap` (≥ minPot) is still checked first; `setMinPot` is not rate-limited. |
+| **L1** | Low | The LP gate (pass-5 F6) covered **add** but not **remove**, so the remove path ran no hook code. **Fix:** added `beforeRemoveLiquidity` applying the same `_onlyProtocolLp` initializer gate; `REQUIRED_FLAGS` gains `BEFORE_REMOVE_LIQUIDITY (1<<9)` → **`0x1844`→`0x1A44`**, hook re-mined, deploy scripts + all `FLAGS` test constants updated. |
+| **L2** | Low | `lockEngines()` could freeze an **incomplete/mismatched** binding set. **Fix:** it now requires `n != 0 && n == vaults.length` and that every `engineVault[engines[i]] == vaults[i]` (non-zero) before locking — else `IncompleteBindings`. |
+| **L3** | Low | `lockRouting()` froze `setRouting` but **not `setAdapters`**, leaving a post-lock way to redirect conversion through a swapped adapter. **Fix:** `setAdapters` now reverts `RoutingAlreadyLocked` once routing is locked. |
+| **L4** | Low | Deploy did not assert the HolderDraw and Raffle engines share a `genesis`. **Fix:** `Deploy.s.sol` / `DeployTestnet.s.sol` add `require(HolderDrawEngine.genesis() == RaffleEngine.genesis())`. |
+| **L5** | Low | A single reverting payout inside `claimBatch` reverted the **whole batch** (griefing). **Fix:** each payout runs as `try this.settleSelf(id) { ++claimed } catch {}`; a reverting claim is left **unsettled + still reserved** for a plain retry, and every other claim in the batch still pays. `settleSelf` deliberately carries **no** `nonReentrant` (the batch already holds the guard). |
+| **L7** | Low | `QpullWethAdapter` negated an `int128` before widening, mishandling the `type(int128).min` edge. **Fix:** promote to `int256` before negation. |
+| **L9** | Low | `BlsDrandOracle` probed only the `PAIRING` precompile at construction. **Fix:** also `staticcall` `MAP_FP_TO_G1` and require a 128-byte reply, else `PrecompileUnavailable`. |
+| **Info** | Info | `convert()` skips the team-WETH transfer when the computed team cut is 0 (`if (teamWeth > 0)`), avoiding a needless zero-value transfer. |
+
+### Accepted / documented (no code change)
+
+| # | Sev | Disposition |
+|---|-----|-------------|
+| **M1** | Med | The `convert()` **keeper is a hot key** by design (rotatable, deliberately not frozen by `lockRouting`). Trust is bounded to *timing* — it cannot change destinations (routing is lockable) or amounts (fixed BPS). Runbook item; same class as F9/M-2. |
+| **M2** | Med | Sequencer `delaySeconds` / oracle liveness (= pass-5 M-7). Re-verified on-chain (RH `SequencerInbox.maxTimeVariation.delaySeconds` = 4 days); `REVEAL_LAG` margins hold. Monitored as a governance event. |
+| **L6** | Low | A QUOTRON pause would stall `convert()`. Same disposition as F3 — no owner rescue by design; funds are never lost, only delayed until unpause. |
+| **L8** | Low | Holder-draw eligibility reads live balances (a flash-hold could momentarily qualify). Accepted: the draw is **mint-seeded**, not tax-funded, and the snapshot semantics are documented. |
+| **L10–L12 / I1–I15** | Low/Info | Refuted or documented (rounding <1 wei favors the trader; framing duplicates of F1/F7; convention/gracefulness notes). No code impact. |
+
+*Residual pre-mainnet recommendations are unchanged: a dedicated cryptographic review of `BlsDrandOracle`
+and a **V4-hook specialist review of `QpullTaxHook`** — the latter also being the artifact a Uniswap-interface
+hook-allowlist submission would require.*
+
+---
+
 *This remediation was prepared with AI assistance and is not a substitute for an independent human security
 review. A dedicated cryptographic review of `BlsDrandOracle` and a **V4-hook specialist review of
 `QpullTaxHook`** remain recommended before mainnet. QUOTRON's ERC-404 semantics (M-6/M-8), Robinhood
 Chain's EIP-2537 support (H-4), and its sequencer `delaySeconds` (M-7) have all been verified on-chain /
 against source and are addressed above; the residual QUOTRON-admin trust surface is documented and gated
 by the §9 launch check. Pass-4's F4 / pass-5's F6 (V4 liquidity-callback tax gap) is now **resolved** —
-liquidity provision is restricted to the protocol (hook re-mined to `0x1844`, §12).*
+liquidity provision is restricted to the protocol, with the gate covering both ADD and REMOVE after
+pass-6's L1 (hook re-mined to `0x1A44`, §12–13).*

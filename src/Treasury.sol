@@ -96,7 +96,10 @@ contract Treasury is NonRenounceableOwnable2Step, ReentrancyGuard, IERC721Receiv
         emit KeeperSet(k, v);
     }
 
+    /// @dev audit L3 (job-745): the swap adapters custody QPULL/WETH mid-convert(), so lockRouting() freezes
+    ///      them too — every convert() binding is now under the one-way launch lock, no asymmetric exception.
     function setAdapters(address qpullWeth_, address wethQuotron_) external onlyOwner {
+        if (routingLocked) revert RoutingAlreadyLocked();
         if (qpullWeth_ == address(0) || wethQuotron_ == address(0)) revert NotConfigured(); // audit L-5
         qpullWeth = ISwapAdapter(qpullWeth_);
         wethQuotron = ISwapAdapter(wethQuotron_);
@@ -126,6 +129,12 @@ contract Treasury is NonRenounceableOwnable2Step, ReentrancyGuard, IERC721Receiv
     ///         compromised owner key) can redirect prize funding or the team cut. The keeper role is left
     ///         rotatable by design (setKeeper); its only residual is the bounded, cap-limited convert MEV.
     function lockRouting() external onlyOwner {
+        // audit L2 (job-745): refuse to freeze an INCOMPLETE config — locking before wiring would brick
+        // convert() forever. Require exactly what convert() demands (adapters + all four destinations).
+        if (
+            address(qpullWeth) == address(0) || address(wethQuotron) == address(0) || prizeVault == address(0)
+                || jackpotVault == address(0) || leaderboardVault == address(0) || team == address(0)
+        ) revert NotConfigured();
         routingLocked = true;
         emit RoutingLocked();
     }
@@ -205,7 +214,7 @@ contract Treasury is NonRenounceableOwnable2Step, ReentrancyGuard, IERC721Receiv
         uint256 wethOut = weth.balanceOf(address(this)); // swapped + hook-fee WETH; all of it is tax
         if (wethOut > maxWethConvertPerCall) wethOut = maxWethConvertPerCall;
         uint256 teamWeth = (wethOut * TEAM_BPS) / BPS;
-        weth.safeTransfer(team, teamWeth);
+        if (teamWeth > 0) weth.safeTransfer(team, teamWeth); // audit job-745 info: zero-guard like the QUOTRON legs
         uint256 prizeWeth = wethOut - teamWeth;
 
         // 3. prize WETH -> QUOTRON — measured delta again (audit H-14)
@@ -213,21 +222,38 @@ contract Treasury is NonRenounceableOwnable2Step, ReentrancyGuard, IERC721Receiv
         weth.forceApprove(address(wethQuotron), prizeWeth);
         wethQuotron.swapExactIn(address(weth), address(quotron), prizeWeth, minQuotronOut, address(this));
         weth.forceApprove(address(wethQuotron), 0); // audit L-10: leave no residual allowance
-        uint256 qOut = quotron.balanceOf(address(this)) - qBefore;
+        uint256 qOut = quotron.balanceOf(address(this)) - qBefore; // THIS-swap delta — the floor check keys on it
         if (qOut < minQuotronOut) revert SwapShortfall();
 
-        // 4. split QUOTRON across the prize vaults (of the 8000 prize bps). Each leg is guarded against a
-        //    zero-value transfer (audit M-5): a thin batch can floor toJackpot/toLeaderboard to 0 (their
-        //    value then rides in toHourly), and an adversarial QUOTRON that reverts on 0-value transfers
-        //    would otherwise brick convert() at small batch sizes.
-        uint256 toJackpot = (qOut * JACKPOT_BPS) / PRIZE_BPS;
-        uint256 toLeaderboard = (qOut * LEADERBOARD_BPS) / PRIZE_BPS;
-        uint256 toHourly = qOut - toJackpot - toLeaderboard;
-        if (toHourly > 0) quotron.safeTransfer(prizeVault, toHourly);
-        if (toJackpot > 0) quotron.safeTransfer(jackpotVault, toJackpot);
-        if (toLeaderboard > 0) quotron.safeTransfer(leaderboardVault, toLeaderboard);
+        // 4. split the FULL held QUOTRON across the prize vaults (of the 8000 prize bps). audit M3 (job-745):
+        //    the three sends are per-vault ISOLATED (best-effort) so a QUOTRON per-address blacklist of ONE
+        //    vault can no longer revert the whole convert() and starve the other two + the team/QPULL legs.
+        //    A blacklisted vault's slice simply stays in the Treasury and rides the NEXT call's full-balance
+        //    split (qBal = qBefore + qOut), so it retries automatically and is never permanently stranded.
+        //    (This does NOT defend the shared-codehash bannedVenueCodehash ban or a global QUOTRON pause,
+        //    which hit all four vaults at once — an accepted external-admin trust boundary; see SECURITY.md.)
+        //    Zero-value legs are skipped (audit M-5): a thin batch floors toJackpot/toLeaderboard to 0.
+        uint256 qBal = quotron.balanceOf(address(this));
+        uint256 toJackpot = (qBal * JACKPOT_BPS) / PRIZE_BPS;
+        uint256 toLeaderboard = (qBal * LEADERBOARD_BPS) / PRIZE_BPS;
+        uint256 toHourly = qBal - toJackpot - toLeaderboard;
+        _trySendQuotron(prizeVault, toHourly);
+        _trySendQuotron(jackpotVault, toJackpot);
+        _trySendQuotron(leaderboardVault, toLeaderboard);
 
         emit Converted(qpullIn, wethOut, qOut, teamWeth);
+    }
+
+    /// @dev audit M3 (job-745): best-effort QUOTRON send. A per-address-blacklisted recipient must not brick
+    ///      the whole convert() — its slice stays in the Treasury and drains on the next call's full-balance
+    ///      split. Self-correcting: no "distributed" state is tracked; balanceOf is re-read each call, so even
+    ///      a token that returns false (rather than reverting) cannot desync accounting. Reentrancy-safe:
+    ///      convert() is nonReentrant, this is its LAST step (no state writes after), and real QUOTRON
+    ///      auto-exempts contract recipients from the ERC-404 receiver callback.
+    function _trySendQuotron(address to, uint256 amount) private {
+        if (amount == 0) return; // preserves the M-5 zero-value skip
+        (bool ok,) = address(quotron).call(abi.encodeCall(IERC20.transfer, (to, amount)));
+        ok; // deliberately ignored: on failure the slice simply stays in the Treasury balance
     }
 
     /// @notice ERC-404 terminal-mint safety (§13.3), defense-in-depth. A convert() batch that buys ≥1

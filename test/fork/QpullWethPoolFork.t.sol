@@ -74,7 +74,7 @@ contract QpullWethPoolForkTest is Test {
     string RPC = vm.envOr("RH_RPC_URL", string("https://rpc.mainnet.chain.robinhood.com"));
 
     uint160 constant SQRT_1_1 = 79_228_162_514_264_337_593_543_950_336; // 2**96 -> price 1:1
-    uint160 constant FLAGS = (1 << 12) | (1 << 11) | (1 << 6) | (1 << 2); // +beforeAddLiquidity (0x1844)
+    uint160 constant FLAGS = (1 << 12) | (1 << 11) | (1 << 9) | (1 << 6) | (1 << 2); // add+remove LP gate (0x1A44)
     uint160 constant MIN_PRICE_P1 = 4_295_128_739 + 1;
     uint160 constant MAX_PRICE_M1 = 1_461_446_703_485_210_103_287_273_052_203_988_822_378_723_970_342 - 1;
 

@@ -27,12 +27,15 @@ contract LeaderboardEngine is NonRenounceableOwnable2Step, ReentrancyGuard {
 
     uint256 internal constant WEEK = 7 days;
     uint256 public constant CLAIM_WINDOW = 30 days;
+    uint256 internal constant BPS = 10_000;
+    uint256 internal constant MAX_ADJ_BPS = 2500; // audit M4 (job-745): potCap re-peg bounded to +/-25%/week
 
     // audit M-7: bound a single week's payout; excess rolls forward. audit F14 (pass-5): REQUIRED (> 0) at
     // construction now (no fail-open type(uint256).max default) — a sole board member in a quiet week is
     // 100% of totalPoints, so uncapped it could take a whole rolled-forward vault balance in one distribute.
     uint256 public potCap;
     uint256 public minPot; // audit C-1: floor below which distribute voids WITHOUT consuming the week
+    uint64 public lastPotAdjust; // audit M4 (job-745): timestamp of the last setPotCap (cooldown anchor)
     mapping(uint256 => bool) public distributed;
 
     event Distributed(uint256 indexed week, uint256 pot, uint256 winners);
@@ -44,6 +47,8 @@ contract LeaderboardEngine is NonRenounceableOwnable2Step, ReentrancyGuard {
     error BadPotCap();
     error BadMinPot(); // audit F5
     error GenesisMismatch();
+    error AdjustTooSoon(); // audit M4 (job-745)
+    error AdjustOutOfBounds(); // audit M4 (job-745)
 
     constructor(
         address registry_,
@@ -71,8 +76,15 @@ contract LeaderboardEngine is NonRenounceableOwnable2Step, ReentrancyGuard {
     }
 
     /// @notice Bound a single week's payout (audit M-7). Never below the minPot floor (audit L-3).
+    /// @dev    audit M4 (job-745): rate-limited to +/-25% per week (one change per week), so an owner cannot
+    ///         front-run a determined weekly distribute to shrink a known winner's payout.
     function setPotCap(uint256 c) external onlyOwner {
         if (c == 0 || c < minPot) revert BadPotCap();
+        if (block.timestamp < uint256(lastPotAdjust) + WEEK) revert AdjustTooSoon();
+        uint256 lo = (potCap * (BPS - MAX_ADJ_BPS)) / BPS;
+        uint256 hi = (potCap * (BPS + MAX_ADJ_BPS)) / BPS;
+        if (c < lo || c > hi) revert AdjustOutOfBounds();
+        lastPotAdjust = uint64(block.timestamp);
         potCap = c;
         emit PotCapSet(c);
     }

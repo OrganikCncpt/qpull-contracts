@@ -31,7 +31,7 @@ import { MockRecorder } from "./mocks/MockRecorder.sol";
 ///           4. a public buy is taxed 4% to the Treasury, and the first-hour NFT-holder gate applies.
 ///         This is the single proof that the whole raise-to-launch-to-trade pipeline actually works.
 contract RaiseToLaunchTest is Test {
-    uint160 constant FLAGS = (1 << 12) | (1 << 11) | (1 << 6) | (1 << 2); // +beforeAddLiquidity (0x1844)
+    uint160 constant FLAGS = (1 << 12) | (1 << 11) | (1 << 9) | (1 << 6) | (1 << 2); // add+remove LP gate (0x1A44)
     uint160 constant SQRT_1_1 = 79_228_162_514_264_337_593_543_950_336;
     uint160 constant MIN_PRICE_P1 = 4_295_128_739 + 1;
     uint160 constant MAX_PRICE_M1 = 1_461_446_703_485_210_103_287_273_052_203_988_822_378_723_970_342 - 1;

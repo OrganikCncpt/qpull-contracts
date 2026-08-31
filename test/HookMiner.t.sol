@@ -15,7 +15,7 @@ import { MockRecorder } from "./mocks/MockRecorder.sol";
 contract HookMinerTest is Test {
     // the canonical deterministic CREATE2 deployer (Foundry pre-deploys it locally too)
     address constant CREATE2 = 0x4e59b44847b379578588920cA78FbF26c0B4956C;
-    uint160 constant FLAGS = (1 << 12) | (1 << 11) | (1 << 6) | (1 << 2); // = REQUIRED_FLAGS (0x1844)
+    uint160 constant FLAGS = (1 << 12) | (1 << 11) | (1 << 9) | (1 << 6) | (1 << 2); // = REQUIRED_FLAGS (0x1A44)
 
     function test_mineAndDeployThroughCreate2() public {
         MockERC20 qpull = new MockERC20();
