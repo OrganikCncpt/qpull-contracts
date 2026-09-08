@@ -40,6 +40,7 @@ contract LaunchTransferLockTest is Test {
         vm.warp(GENESIS);
         oracle = new MockDrandOracle(GENESIS, 30);
         renderer = new PassArtRenderer(address(this));
+        renderer.lock(); // preaudit: NFTCollection ctor now requires a locked renderer
         nft = new NFTCollection(PRICE, address(oracle), 1 hours, address(renderer), address(this));
         nft.setRecipients(lp, seed, team);
         nft.setAllowlistRoot(keccak256(abi.encodePacked(address(this)))); // non-zero root; public path needs no proof

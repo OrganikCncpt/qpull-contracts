@@ -217,6 +217,7 @@ contract NFTCollection is INFTCollection, ERC721, NonRenounceableOwnable2Step, R
     error ZeroDrand();
     error BadRevealDelay();
     error ZeroRenderer();
+    error RendererNotLocked(); // preaudit: the bound art renderer must be locked (immutable) before the collection binds it
     error MintWindowClosed(); // pass-9/pass-10: a closed-by-time boundary passed (the 48h public window
     // or the 30d launch backstop), so every mint path is closed
     error AlreadyStarted(); // pass-11: the mint starts exactly once; mintStart never moves
@@ -249,6 +250,10 @@ contract NFTCollection is INFTCollection, ERC721, NonRenounceableOwnable2Step, R
         // (Virtual getter: a subclass that shortens the step is held to the same rule at construction.)
         if (revealDelay_ >= REVEAL_FALLBACK_STEP()) revert RevealDelayExceedsFallbackStep();
         if (renderer_ == address(0)) revert ZeroRenderer(); // art must be wired at deploy (immutable, no setter)
+        // preaudit: the art must be FROZEN before the collection binds it. PassArtRenderer.lock() is one-way,
+        // so requiring locked() here means a bound renderer's owner can never addChunk/swap the art of a
+        // revealed pass after deploy. DeployPassArt locks the renderer, then deploys this NFT against it.
+        if (!IPassArtRenderer(renderer_).locked()) revert RendererNotLocked();
         mintPrice = mintPrice_;
         drand = IDrandOracle(drand_);
         revealDelay = revealDelay_;

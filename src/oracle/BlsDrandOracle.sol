@@ -22,6 +22,7 @@ import { IDrandOracle } from "../interfaces/IDrandOracle.sol";
 ///         dedicated cryptographic review before mainnet.
 contract BlsDrandOracle is IDrandOracle {
     // precompiles
+    address internal constant SHA256 = address(0x02);
     address internal constant MODEXP = address(0x05);
     address internal constant BLS_G1ADD = address(0x0b);
     address internal constant BLS_PAIRING = address(0x0f);
@@ -93,6 +94,18 @@ contract BlsDrandOracle is IDrandOracle {
         // bytes = the Fp encoding of 0 (a valid field element); map_to_curve is total -> a 128-byte G1 point.
         (bool okMap, bytes memory mapOut) = BLS_MAP_FP_TO_G1.staticcall(new bytes(64));
         if (!okMap || mapOut.length != 128) revert PrecompileUnavailable();
+        // finding #2 (info): the beacon-verify path ALSO hard-depends on two universal precompiles —
+        // SHA-256 (0x02), used for the message and expand_message_xmd, and MODEXP (0x05), used by _toFp for
+        // the `mod p` reduction. They exist on every EVM chain, but for completeness gate them the same
+        // fail-closed way so this oracle can NEVER deploy where ANY of its precompiles is missing. SHA-256:
+        // any input -> a 32-byte digest (absent -> 0-length). MODEXP: 1^1 mod 2 = 1 with base/exp/mod
+        // lengths all 1 (three 32-byte length words, then the value bytes 01 01 02) -> a 1-byte 0x01.
+        (bool okSha, bytes memory shaOut) = SHA256.staticcall(new bytes(1));
+        if (!okSha || shaOut.length != 32) revert PrecompileUnavailable();
+        (bool okMod, bytes memory modOut) = MODEXP.staticcall(
+            bytes.concat(bytes32(uint256(1)), bytes32(uint256(1)), bytes32(uint256(1)), hex"010102")
+        );
+        if (!okMod || modOut.length != 1 || modOut[0] != 0x01) revert PrecompileUnavailable();
     }
 
     /// @notice Permissionless: submit round `round`'s drand signature in BOTH forms - the 48-byte COMPRESSED

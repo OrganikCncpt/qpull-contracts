@@ -265,6 +265,7 @@ contract SelfTransferGuardProbe is Test {
         vm.warp(1_000_000);
         oracle = new MockDrandOracle(1_000_000, 30);
         renderer = new PassArtRenderer(address(this));
+        renderer.lock(); // preaudit: NFTCollection ctor now requires a locked renderer
         nft = new NFTCollection(PRICE, address(oracle), 1 hours, address(renderer), address(this));
         nft.setRecipients(lp, seed, team);
         nft.setAllowlistRoot(keccak256("guard-probe")); // any non-zero root; the open path is used below

@@ -3,7 +3,20 @@ pragma solidity 0.8.26;
 
 import { Test } from "forge-std/Test.sol";
 import { NFTCollection } from "../src/NFTCollection.sol";
+import { IPassArtRenderer } from "../src/interfaces/IPassArtRenderer.sol";
 import { MockDrandOracle } from "./mocks/MockDrandOracle.sol";
+
+/// @notice Minimal renderer stand-in: these tests never call tokenURI, but NFTCollection now requires the
+///         bound renderer to report locked() == true at construction (preaudit: art frozen before binding).
+contract MockLockedRenderer is IPassArtRenderer {
+    function locked() external pure returns (bool) {
+        return true;
+    }
+
+    function tokenURI(uint256, bool, uint8) external pure returns (string memory) {
+        return "";
+    }
+}
 
 /// @notice Configurable stand-in for the delegate.xyz v2 registry.
 contract MockDelegateRegistry {
@@ -28,6 +41,7 @@ contract NFTCollectionDelegatedTest is Test {
     NFTCollection nft;
     MockDrandOracle oracle;
     MockDelegateRegistry reg;
+    MockLockedRenderer renderer;
 
     address vaultA = makeAddr("vaultA"); // allowlisted, kept limited
     address delegateB = makeAddr("delegateB"); // hot wallet that operates
@@ -39,7 +53,8 @@ contract NFTCollectionDelegatedTest is Test {
         vm.warp(GEN);
         oracle = new MockDrandOracle(GEN, 3);
         reg = new MockDelegateRegistry();
-        nft = new NFTCollection(PRICE, address(oracle), 1 hours, address(0xBEEF), address(this));
+        renderer = new MockLockedRenderer();
+        nft = new NFTCollection(PRICE, address(oracle), 1 hours, address(renderer), address(this));
         nft.setRecipients(address(this), makeAddr("seed"), makeAddr("team"));
         nft.setDelegateRegistry(address(reg)); // before opening the mint
         nft.setMintOpen(true);
@@ -104,7 +119,7 @@ contract NFTCollectionDelegatedTest is Test {
 
     // ── delegated mint is off until a registry is wired ──
     function test_delegatedMint_disabledWhenRegistryUnset() public {
-        NFTCollection n2 = new NFTCollection(PRICE, address(oracle), 1 hours, address(0xBEEF), address(this));
+        NFTCollection n2 = new NFTCollection(PRICE, address(oracle), 1 hours, address(renderer), address(this));
         n2.setRecipients(address(this), makeAddr("s2"), makeAddr("t2"));
         n2.setMintOpen(true);
         n2.setAllowlistRoot(keccak256(abi.encodePacked(vaultA)));

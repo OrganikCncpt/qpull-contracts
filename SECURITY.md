@@ -75,7 +75,7 @@ The whole tree is in scope, but these four surfaces carry the largest blast radi
 catastrophic rather than bounded, so they warrant the deepest attention:
 
 **1. Randomness — the fairness root.** *Invariant:* no draw or reveal beacon is knowable or forgeable before
-its cutoff. *Defenses:* trustless on-chain BLS verification of drand quicknet (`BlsDrandOracle`);
+its cutoff. *Defenses:* trustless onchain BLS verification of drand quicknet (`BlsDrandOracle`);
 future-bound reveal rounds with a `REVEAL_LAG` buffer; `roundAt` returns the first round at/after a cutoff
 (ceil). *Please double-check:* (a) can the BLS verifier accept an invalid signature? — one false-accept makes
 every outcome forgeable; (b) is any consumer's reveal round knowable before its entry/snapshot window closes
@@ -114,7 +114,7 @@ sign-off is still recommended before mainnet** — hooks are V4's most dangerous
 The **accepted, bounded risks** are catalogued in §3 — we welcome disagreement with our reasoning there.
 Before writing findings, please also read the two sections immediately below: **Out of scope** (features that
 are discussed elsewhere but deliberately **not built**) and **External dependency assumptions** (three
-off-repo facts already evidenced on-chain, offered so the engagement is not spent re-deriving them).
+off-repo facts already evidenced onchain, offered so the engagement is not spent re-deriving them).
 
 ---
 
@@ -226,12 +226,12 @@ timelocked**, before relying on QUOTRON for prizes.
 ## 2. Resolved by governance (owner = Timelock + Multisig)
 
 The audit's "malicious-owner" findings are resolved by the deployment's ownership model, **not by code**. To
-be precise about what that means on-chain (audit pass-4, Finding 2): there is **no built-in timelock or pause
+be precise about what that means onchain (audit pass-4, Finding 2): there is **no built-in timelock or pause
 anywhere in these contracts** — every `onlyOwner` setter takes effect in the same block it is called. The
 mitigation is a **deployment step**: at launch, ownership of each contract is transferred to an external
 OpenZeppelin `TimelockController` (delay ≥ 48h) controlled by a multisig, and renounced where no further
 changes are needed. So the "timelock" is an *owner the contracts are handed to*, not a mechanism inside them.
-**Integrators and users must verify, on-chain post-launch, that each contract's `owner()` is in fact that
+**Integrators and users must verify, onchain post-launch, that each contract's `owner()` is in fact that
 timelock** (and that mandatory bindings were set before any `renounceOwnership`) — until that transfer, and if
 it is skipped, the control model is same-block multisig with the full blast radius the audit enumerates
 (drain vaults, forge entries, etc.). A timelock delay far exceeding any draw window (raffle 1 day, holder 1
@@ -373,7 +373,7 @@ and setter **M-13**). Properties:
   disabled by design (the pool is protocol-owned liquidity; permissionless LP in a taxed-swap pool is itself
   the exploit).
 - The Treasury's `QpullWethAdapter` is the hook's **`exemptSender`** (conversion swaps pay no fee);
-  `setPoolKey` verifies that binding on-chain.
+  `setPoolKey` verifies that binding onchain.
 
 **Internal adversarial review.** This revision was reviewed by a multi-agent pass across four lenses
 (V4 delta/settlement accounting, economic evasion, DoS/gate/pool-creation, cross-contract integration), each
@@ -404,7 +404,7 @@ Required steps not wired by `Deploy.s.sol`:
    Set them at go-live and read back that both are `!= 0` and `!= type(uint256).max`. `Deploy` auto-arms
    **`ClaimManager.lockEngines()`** (pass-5 F1) with the exact three engine/vault pairs. **`Treasury.lockRouting()`
    is NO LONGER armed by `Deploy`:** it is the FINAL go-live step, run only after both adapter legs are
-   fork-verified end-to-end against the live pools (§16.6; the ordered steps with their on-chain post-conditions
+   fork-verified end-to-end against the live pools (§16.6; the ordered steps with their onchain post-conditions
    are `LAUNCH-CHECKLIST.md` §6b). *(H-1/H-3, pass-5 F1/F2, pre-audit MEDIUM "convert caps unwired")*
 4. After the NFT mint closes: **`finalizeLaunch()`** (seals rarity), then **`withdrawProceeds()`**. *(H-13)*
 5. **GO-LIVE (H-2), THROUGH THE PERMANENT LOCK:** from the deployer key, run `script/GoLiveMainnet.s.sol`,
@@ -422,7 +422,7 @@ Required steps not wired by `Deploy.s.sol`:
    omits the lock"; `docs/LIQUIDITY-LOCK-SPEC.md`)*
 6. Transfer all ownership to the **Timelock + multisig**; renounce where no further changes are expected. The
    tax hook has no owner, so nothing to transfer there. *(§2)*
-7. Verify the keeper is posting drand beacons on-chain before the first draw window closes.
+7. Verify the keeper is posting drand beacons onchain before the first draw window closes.
 8. **QUOTRON gate check (§10, M-6/M-8 trust note):** confirm the four `BaseVault`s, `ClaimManager`, and
    `Treasury` addresses/codehashes are not on QUOTRON's blacklist or `bannedVenueCodehash` list, and
    confirm who controls QUOTRON's `paused`/blacklist (ideally timelocked) before relying on it for prizes.
@@ -441,7 +441,7 @@ config), or accepted with rationale.
 | # | Sev | Finding | Change |
 |---|---|---|---|
 | **H-1** | High | `convert()`'s WETH→QUOTRON leg had no per-call cap — a WETH donation could brick the whole pipeline (the H-2 rework introduced WETH as a second, donation-inflatable tax currency) | Added `maxWethConvertPerCall`, symmetric to `maxConvertPerCall`; the WETH slice is capped and the remainder drains over later calls. |
-| **H-2** | High | `minPot` shipped at an unsafe `0` default on Jackpot/HolderDraw (their only config-independent guard voids at 1 / 5 wei), so a missed runbook step re-opened the C-1 dust-grief | `minPot` is now a **required (> 0) constructor argument** on `JackpotEngine`/`HolderDrawEngine` (fail-closed on-chain); `Deploy` also wires every engine's floor so it never depends on a post-deploy step. |
+| **H-2** | High | `minPot` shipped at an unsafe `0` default on Jackpot/HolderDraw (their only config-independent guard voids at 1 / 5 wei), so a missed runbook step re-opened the C-1 dust-grief | `minPot` is now a **required (> 0) constructor argument** on `JackpotEngine`/`HolderDrawEngine` (fail-closed onchain); `Deploy` also wires every engine's floor so it never depends on a post-deploy step. |
 | **H-3** | High | `RaffleEngine` was the only draw engine without a `potCap` — a delaying winner could inflate their own payout | Added an owner-set `potCap` (clamp identical to the sibling engines); excess rolls forward. |
 | **M-1** | Med | `ClaimManager`'s bool engine allowlist had no per-vault binding — one authorized/compromised engine could drain **all four** vaults, defeating `BaseVault`'s immutable-controller guarantee | `engineVault` binds each engine to exactly **one** vault; `registerClaim` reverts `WrongVault` otherwise. Blast radius is now a single game's vault. |
 | **M-4** | Med | `setExcluded` could run mid-snapshot, freezing an internally-inconsistent owner set | Reverted `SnapshotInProgress` while a snapshot was partway done. **Obsolete under Option C:** the snapshot (and `SnapshotInProgress`) are deleted; `setExcluded` is now a scheduled toggle taking effect the following period under a 1-week cooldown (§15 pass-8 H-5, §3 H-5), so there is no mid-snapshot window to guard. |
@@ -459,14 +459,14 @@ config), or accepted with rationale.
 | # | Sev | Disposition |
 |---|---|---|
 | **H-4** | High | **Operational, verified separately.** The EIP-2537 precompiles (`0x0b`/`0x0f`/`0x10`) were confirmed live on the actual Robinhood Chain RPC via a direct precompile probe during development (not inferred from `evm_version`), and the code is fail-closed if they were ever absent. Re-confirm on the final deploy target as a launch gate. |
-| **M-2** | Med | **Accepted / mitigated.** No trustworthy on-chain price reference exists (QPULL's only price is its own pool, so a TWAP is itself manipulable). Mitigated by the keeper gate (rotatable key) plus `maxConvertPerCall` **and now `maxWethConvertPerCall`**, which bound a single-slice sandwich; documented. |
+| **M-2** | Med | **Accepted / mitigated.** No trustworthy onchain price reference exists (QPULL's only price is its own pool, so a TWAP is itself manipulable). Mitigated by the keeper gate (rotatable key) plus `maxConvertPerCall` **and now `maxWethConvertPerCall`**, which bound a single-slice sandwich; documented. |
 | **M-3** | Med | **Governance (§2)** — the timelock+multisig model is the resolution for re-settable bindings; the missing zero-check portion is fixed as L-5. |
 | **M-6, M-8** | Med | **Verified against QUOTRON's source and resolved.** QUOTRON's verified source (`Quotron404V2`, 18 dec, on the RH Blockscout explorer) was read directly. **M-6 (fee-on-transfer): does not apply** — `_transfer` does `balanceOf[to] += amount` with no skim; recipients receive the full amount (reflections pay out in a separate stock token, never a cut of QUOTRON). **M-8 (external balance reduction): does not apply** — the whole-unit rebalance (`_syncDown`/`_syncUp`) mutates only the NFT layer (`_darkOwned`/`_ownerOf`/pool), **not** `balanceOf`, so third-party trading around a vault cannot reduce its fractional balance; `balanceOf` only decreases via the holder's own `_transfer`/`hardwire` (or QUOTRON-admin recovery — see the trust note). |
 
 **QUOTRON is a trusted, admin-controlled external dependency (learned from reading its source; not a code issue in this repo).** `Quotron404V2._checkTransferAllowed` gates every transfer on: a **`paused`** flag, a **blacklist** (`from`/`to`/`msg.sender`), a **`bannedVenueCodehash`** check (transfers revert if any party's contract codehash is banned — the four `BaseVault`s share one codehash), and an **`adminTransferTerminal`** recovery power that can move a whole unit out of any account. Prize *liveness* therefore depends on trusting QUOTRON's admin not to pause, blacklist, or ban-codehash the protocol's vaults / `ClaimManager` / winners. This is the same class as trusting QUOTRON to be a real prize token at all, and is surfaced here as an explicit assumption. **Launch check (added to §9):** confirm the protocol's vault / ClaimManager / Treasury addresses and codehashes are not on QUOTRON's blacklist or `bannedVenueCodehash` list, and understand who controls QUOTRON's pause/blacklist and whether it is timelocked.
 | **M-7** | Med | **Confirmed and addressed by cadence.** RH's `maxTimeVariation.delaySeconds` was read directly from its SequencerInbox on Ethereum L1 (`0xBd0D173EEb87D57A09521c24388a12789F33ba96` → `delaySeconds = 345_600 = 4 days`; `futureSeconds = 3_600 = 1h`). The sealed-then-revealed guarantee is code-enforced iff `REVEAL_LAG > delaySeconds`. **`REVEAL_LAG` is now sized per cadence: JackpotEngine = 5 days and HolderDrawEngine = 4.5 days — both exceed the 4-day bound, so the two highest-value randomized draws (jackpot winner-take-all; weekly holder draw) are fully code-enforced** even against a maximally back-dating sequencer (their 14-day / 7-day windows absorb the lag). The **daily raffle** (and per-cohort pack-tier reveal) structurally cannot set `REVEAL_LAG` above ~1 day, so those remain `1h` and rely on the standard trusted-sequencer assumption every Arbitrum L2 already requires; the residual is bounded (a daily bucket-split pot is far lower value than the jackpot, and the attack needs the RH-operated sequencer to catastrophically mis-stamp time — which breaks the whole chain, not just this raffle). |
 | **L-4** | Low | **Runbook** — do not `renounceOwnership` on contracts that need ongoing hot-key rotation (keeper) or before mandatory bindings are set; set bindings first. |
-| **L-6, L-7** | Low | **Owner-trust / accepted** — mint-recipient choice and `baseURI` mutability are owner responsibilities; on-chain rarity is immutable regardless. |
+| **L-6, L-7** | Low | **Owner-trust / accepted** — mint-recipient choice and `baseURI` mutability are owner responsibilities; onchain rarity is immutable regardless. |
 | **L-8, L-12** | Low | **Accepted (perk-only, immutable hook)** — the 2-hour launch gate is anti-snipe, not fund-safety; `tx.origin` and the launch-time window are the deliberate design (§8). No fund impact. |
 | **L-9** | Low | **N/A** — QUOTRON is 18-decimal. |
 | **L-11** | Low | **Accepted design** — void-on-miss denies the keeper a timing advantage; a skipped window rolls funds forward (liveness, not loss). |
@@ -485,7 +485,7 @@ decision, verified against QUOTRON's source, or pre-mainnet operational/crypto c
 | # | Sev | Finding | Change |
 |---|---|---|---|
 | **F3** | High | `HolderDrawEngine.snapshot()` was permissionless + **chunked**, so an attacker could choose each token's freeze instant (buy, then `snapshot(1)`, then sell, serially) and capture draw slots with transient capital (~250x), or a seller could freeze a buyer out | **Superseded by Option C: the snapshot is DELETED entirely** (`snapshot()`, `snapComplete()`, `snapshotOwnerOf()`, `SUPPLY`, and `SNAP_WINDOW` are all removed). There is no cursor and no freeze buffer left to grief. `runDraw` derives its 5 tokenIds from the beacon in O(1) and reads live `ownerOf`, gated by the per-token `ownerSince[tid] <= snapDeadline(week)` test stamped in `NFTCollection._update` (see §3 H-5). The pass-4 remediation here was an ATOMIC snapshot (one tx freezing all `SUPPLY` tokens); atomizing the loop then hit the measured per-tx gas ceiling at `SUPPLY = 2000` (old §12 F12), which is why Option C removed the loop rather than atomize it. The holding-duration eligibility test now lives in the NFT, not a snapshot buffer, so both the chunked griefing vector and the gas blocker are closed at once. |
-| **F5** | High | `RaffleEngine`/`LeaderboardEngine` `minPot` defaulted to `0` and setters accepted `0` (unlike Jackpot/HolderDraw) — the config-independent guard only floored at wei-scale, so a dust donation could consume a draw window, and on Raffle **destroy real purchased tickets** | `minPot` is now a **required (> 0) constructor argument** on both, and the setters reject `0` — fail-closed on-chain like the sibling engines. |
+| **F5** | High | `RaffleEngine`/`LeaderboardEngine` `minPot` defaulted to `0` and setters accepted `0` (unlike Jackpot/HolderDraw) — the config-independent guard only floored at wei-scale, so a dust donation could consume a draw window, and on Raffle **destroy real purchased tickets** | `minPot` is now a **required (> 0) constructor argument** on both, and the setters reject `0` — fail-closed onchain like the sibling engines. |
 | **F10** | Med | `Treasury.convert()`'s QPULL leg output (bounded by the deep pool) could exceed the WETH-leg cap (sized for the shallow QUOTRON pool), so unprocessed WETH grew every call instead of draining | The QPULL leg now also skips when a full WETH slice is already backed up (`wethHeld >= maxWethConvertPerCall`), draining the WETH backlog first so the two legs can't diverge. |
 | **F14** | Med | Three registries' `setRecorder` were re-settable — a compromised owner could point the recorder at an EOA, forge unlimited game entries, then restore it | `setRecorder` is **write-once** (+ zero-check) on all three registries. |
 | **F15** | Med | `PackRegistry.setEngine` was re-settable and `drawFrom`'s `k` had no internal cap — a re-registered malicious engine could pop **every** live ticket | `setEngine`/`setNft` are **write-once**, and `drawFrom` **clamps `k`** to `MAX_TICKETS_CEILING` internally (independent of the caller). |
@@ -496,7 +496,7 @@ decision, verified against QUOTRON's source, or pre-mainnet operational/crypto c
 | # | Sev | Disposition |
 |---|---|---|
 | **F1** | Critical* | `ClaimManager.setEngine` is owner-settable — a compromised owner could bind an EOA as an "engine" and drain a vault. *Owner-trust* (needs the owner key). Blast radius is now reduced in code — an engine is bound to **one** vault (M-1), the `PackRegistry` engine/recorder bindings are **write-once** (F14/F15), and `drawFrom`'s `k` is clamped (F15) — but `ClaimManager.setEngine` itself stays re-settable (it must bind four engines at deploy) so the residual is the governance model (§2) + renouncing `ClaimManager` ownership after wiring. Rated Critical by the auditor **on the premise that the §2 timelock is not in code** — which §2 now states plainly. |
-| **F2** | High | **Corrected in §2.** There is no on-chain timelock/pause; the model is "transfer ownership to an external timelock+multisig at launch, verify on-chain." The doc no longer implies a code-level timelock. |
+| **F2** | High | **Corrected in §2.** There is no onchain timelock/pause; the model is "transfer ownership to an external timelock+multisig at launch, verify onchain." The doc no longer implies a code-level timelock. |
 | **F11** | Med | `setWinnersPerDay` has no cooldown (unlike `setTicketPrice`). Owner-trust: a reactive retune after a public beacon needs the owner key; the §2 timelock (delay > the 1-day draw window) prevents in-window reaction. Documented; not code-hardened at this pass (a cooldown wouldn't fully close it while the owner can set it before the window). **Superseded — pass-8 H-4 added a cooldown AND the ±25% band to `setWinnersPerDay` (`lastWinnersAdjust`); see §15.** |
 
 ### RESOLVED in pass-5 (§12 F6) — was an open design decision
@@ -511,7 +511,7 @@ decision, verified against QUOTRON's source, or pre-mainnet operational/crypto c
 |---|---|---|
 | **F6, F8** | MH/Med | `tx.origin` reward attribution (a relayer/bundler captures the batch's rewards; reward base is always QPULL). Accepted tradeoff (§8): `tx.origin` is the one unspoofable identity for the gate; rewards can mis-credit but never mis-charge, and every buy-side reward is **−EV to farm** by design, which bounds the "reward discount" economically. Not patchable (immutable hook). |
 | **F7** | Med | Launch-gate (2h) rentability via a transferable NFT — accepted, perk-only, immutable (§8, §10). |
-| **F9** | Med | `Treasury.convert()` keeper slippage / team-cut-before-swap — keeper-trust (M-2): no trustworthy on-chain QUOTRON price reference (shallow pool → manipulable TWAP); mitigated by the keeper gate (rotatable), `maxConvertPerCall`, and `maxWethConvertPerCall`. Documented. |
+| **F9** | Med | `Treasury.convert()` keeper slippage / team-cut-before-swap — keeper-trust (M-2): no trustworthy onchain QUOTRON price reference (shallow pool → manipulable TWAP); mitigated by the keeper gate (rotatable), `maxConvertPerCall`, and `maxWethConvertPerCall`. Documented. |
 | **F12, F13, F17** | Med/Low | QUOTRON-dependent (codehash-ban across the shared-codehash vaults; `payOut` shortfall; oversized-pot whole-unit gas). **Verified against QUOTRON's source (§10):** it is not fee-on-transfer and does not reduce balances outside a holder's own transfer, so M-6/M-8 don't apply in normal operation; the residual is the QUOTRON-admin trust surface documented in §10 and gated by the §9 launch check. No owner rescue is added deliberately (it would contradict "no admin can drain a vault"). |
 | **F18, F19** | Low | `runDraw` gas at `MAX_K=200` (fork-test against real QUOTRON pre-mainnet); `withdrawProceeds` return-data-bomb (recipients are **frozen, owner-chosen** — self-harm, not attacker-reachable). Documented as pre-mainnet checks. |
 | **F20** | Info | BLS soundness rests on the `0x0f` precompile's subgroup check. The precompile is **confirmed present and correct for valid inputs on both RH mainnet and testnet** (§ H-4, direct `eth_call`); the specific subgroup-validation property still warrants the dedicated cryptographic review the code's NatSpec already requests. |
@@ -538,7 +538,7 @@ this pass — restrict LP to the protocol — so it is in **Fixed in code**, not
 | **F5** | Med | Both adapters' `setTreasury` were re-settable despite a "set once" comment; since `QpullWethAdapter` is the hook's immutable `exemptSender`, re-pointing it grants a permanent **0%-tax** QPULL→WETH route (or DoSes `convert()`) | `setTreasury` is now **write-once** (+ zero-check) on both adapters, mirroring `setPoolKey`. |
 | **F14** | Low | `potCap` defaulted to `type(uint256).max` in Raffle/Jackpot/Leaderboard (only HolderDraw required it), and the deploy scripts never capped Jackpot/Leaderboard at all — a sole entrant in a quiet period could capture a whole rolled-forward vault balance | `potCap` is now a **required (> 0) constructor argument** in all four engines, cross-checked `minPot ≤ potCap`, matching HolderDraw + `minPot`. `Deploy` reads `RAFFLE_/JACKPOT_/LEADERBOARD_POT_CAP` (fail-closed `vm.envUint`) and passes them at construction. |
 | **F7** | Low | `QuotronRouterAdapter` accepted ETH (`receive`) with no rescue — a router refund or force-sent ETH would strand | Added owner-only **`sweepETH(to)`** (touches no WETH/QUOTRON accounting — the adapter holds neither between calls). **Pre-audit 2026-09-07 update:** a router ETH refund is now **re-wrapped to WETH and forwarded to the Treasury inside the same `swapExactIn` call** (`RefundForwarded`), so it can neither strand nor escape `convert()`'s shortfall check; `sweepETH` now covers **force-sent ETH only**. |
-| **F10** | Low | The whole randomness system is a hard liveness dependency on the EIP-2537 precompiles; a staticcall to a missing precompile returns success with **empty** data (silent) | `BlsDrandOracle`'s constructor now **probes G1ADD + PAIRING and reverts `PrecompileUnavailable`** if absent — an on-chain fail-closed deploy gate (the script `bls_precompile_check.sh` made mandatory in code). |
+| **F10** | Low | The whole randomness system is a hard liveness dependency on the EIP-2537 precompiles; a staticcall to a missing precompile returns success with **empty** data (silent) | `BlsDrandOracle`'s constructor now **probes G1ADD + PAIRING and reverts `PrecompileUnavailable`** if absent — an onchain fail-closed deploy gate (the script `bls_precompile_check.sh` made mandatory in code). |
 | **F13** | Low | `renounceOwnership` was callable everywhere; renouncing a contract that still needs its owner (engine `setPotCap`, `PackRegistry` re-peg, `Treasury` keeper rotation) permanently bricks those knobs | New `NonRenounceableOwnable2Step` base reverts renounce on the six contracts needing a live owner (engines, `PackRegistry`, `Treasury`); two-step transfer to the launch timelock is unaffected. Contracts whose owner is vestigial post-launch (vaults, registries, NFT, adapters) keep the standard base. |
 | **F6** | Low→High | LP add/remove ran no hook code (flags `0x1044`), so the 4% tax + launch gate didn't cover liquidity ops — an untaxed side-door to acquire/dispose QPULL (also **pass-4's open F4**). **Restrict LP to the protocol:** the hook gained `BEFORE_ADD_LIQUIDITY` (`REQUIRED_FLAGS` `0x1044`→`0x1844` **as of this pass; the shipped value is now `0x1A44` — §13 L1**) and a `beforeAddLiquidity` gate reverting unless `tx.origin == initializer`; the CREATE2 hook address was re-mined; deploy scripts + all hook tests updated. Gating **add** alone was argued to close both directions (no non-protocol position can exist to remove); pass-6 L1 gated **remove** too rather than rely on that argument. Trade-off (accepted): no permissionless community LP. |
 
@@ -550,7 +550,7 @@ this pass — restrict LP to the protocol — so it is in **Fixed in code**, not
 | **F4** | Med | Raffle (1h) + pack-tier (≤1d) reveal-lag structurally cannot exceed the sequencer's 4-day back-dating bound — the daily cadence must leave a same-following-day draw window. This is the documented **M-7** trusted-sequencer residual (Jackpot 5d / HolderDraw 4.5d are code-enforced). No in-scope fix without changing the game cadence. |
 | ~~**F6**~~ | — | **Moved to Fixed in code above** (protocol-only LP built; hook re-mined to `0x1844` in this pass, then to the current **`0x1A44`** by pass-6 L1). This was pass-4's open F4. |
 | **F8** | Low | Single-block (transient) holding eligibility. **Under Option C there is no snapshot at all:** eligibility is the `ownerSince[tokenId] <= snapDeadline(week)` test, read at `runDraw` against live `ownerOf`. A wallet that acquires a pass *before* `snapDeadline` and still holds it at the draw is eligible; one that acquires *after* is not, so a transient flash-hold spanning only the draw block no longer qualifies, and `ownerSince` supplies a minimum holding duration the instant snapshot never gave. The beacon is time-locked, so a holder buys only a proportional chance, bounded by `potCap`. Documented (§3 H-5). |
-| **F9** | Low | Jackpot/HolderDraw `REVEAL_LAG` is hardcoded against the L1 `SequencerInbox.maxTimeVariation` (re-verified on-chain = 4 days; margins 1d / 0.5d). An L2 can't read its own L1 inbox, so no dynamic fix — **runbook: monitor `maxTimeVariation` and treat an increase as a governance event.** |
+| **F9** | Low | Jackpot/HolderDraw `REVEAL_LAG` is hardcoded against the L1 `SequencerInbox.maxTimeVariation` (re-verified onchain = 4 days; margins 1d / 0.5d). An L2 can't read its own L1 inbox, so no dynamic fix — **runbook: monitor `maxTimeVariation` and treat an increase as a governance event.** |
 | **F11** | Low | **Refuted as a DoS.** The `ReentrancyGuardTransient` guard is redundant given `onlyPoolManager` + the PoolManager's unlock-lock, and TSTORE is **proven live on both RH chains** (V4 PoolManager, which requires it, runs there). Kept as belt-and-braces; dropping it would force a hook re-mine for zero gain. |
 | **F12** | Low (RESOLVED) | **Pass-5's refutation was wrong and is struck.** Pass-5 "refuted" the snapshot-gas concern by probing the block header `gasLimit` = `0x4000000000000` (2^50) on both RH chains and concluding the snapshot fit with orders of magnitude of headroom. That number is **not a spendable budget**: `0x4000000000000` is the Nitro constant `GethBlockGasLimit`, a geth-compatibility header field, not a per-tx gas ceiling. (Neither is `50,000,000`, which some tooling reports: that is go-ethereum's default `--rpc.gascap`, an `eth_call` bound on the public endpoint only.) **The real per-transaction ceiling on RH is `32,000,000`, measured three independent ways (2026-09-02):** `ArbGasInfo.getMaxTxGasLimit()` at `0x...006C` (selector `0xaae1cd4c`) returns `0x1e84800` = 32,000,000; `ArbSys.arbOSVersion()` places the chain at ArbOS 61, past the ArbOS 50 clamp branch; and an injected gas burner estimates clean at ~31.98M and is refused at ~32.06M. Corroborated: the largest real RH mainnet tx used 24,237,366 gas under a limit of exactly 32,000,000. Against that ceiling the sold-out atomic snapshot at `SUPPLY = 2000` cost **59,961,132 gas = 187% of 32,000,000**, so it genuinely **did not fit**: a launch blocker, not a "competing reading." **RESOLVED by Option C** (landed after this pass): `HolderDrawEngine.snapshot()` and its `SUPPLY` loop are deleted, and `runDraw` is now bounded rejection sampling that is **supply-independent**, measured at **639,023 gas at n=10 and again at n=2000** (see §3 H-5, §11 F3). The blocker is closed in code, not left to a premise. **One live operational item:** `maxTxGasLimit` is a **live governance parameter** writable via `ArbOwner.SetMaxTxGasLimit` and **can move DOWN**, so it needs a pre-launch re-check against the final deploy target and periodic monitoring thereafter (a governance event to watch, the same class as the sequencer `delaySeconds` monitor). |
 
@@ -584,7 +584,7 @@ remediation (was 179). New regression tests: `test_M3_*`, `test_M4_*`, `test_L1_
 | # | Sev | Disposition |
 |---|-----|-------------|
 | **M1** | Med | The `convert()` **keeper is a hot key** by design (rotatable, deliberately not frozen by `lockRouting`). Trust is bounded to *timing* — it cannot change destinations (routing is lockable) or amounts (fixed BPS). Runbook item; same class as F9/M-2. |
-| **M2** | Med | Sequencer `delaySeconds` / oracle liveness (= pass-5 M-7). Re-verified on-chain (RH `SequencerInbox.maxTimeVariation.delaySeconds` = 4 days); `REVEAL_LAG` margins hold. Monitored as a governance event. |
+| **M2** | Med | Sequencer `delaySeconds` / oracle liveness (= pass-5 M-7). Re-verified onchain (RH `SequencerInbox.maxTimeVariation.delaySeconds` = 4 days); `REVEAL_LAG` margins hold. Monitored as a governance event. |
 | **L6** | Low | A QUOTRON pause would stall `convert()`. Same disposition as F3 — no owner rescue by design; funds are never lost, only delayed until unpause. |
 | **L8** | Low | Holder-draw eligibility. **Under Option C** it reads live `ownerOf` at `runDraw`, gated by `ownerSince[tokenId] <= snapDeadline(week)`, so a flash-hold acquired after the freeze instant does **not** qualify (§3 H-5). Accepted: the eligibility semantics are documented. **Post-audit update:** the draw is now **tax-funded** by the 6.25% holder share (not seed-only); see the post-audit banner at the top. |
 | **L10–L12 / I1–I15** | Low/Info | Refuted or documented (rounding <1 wei favors the trader; framing duplicates of F1/F7; convention/gracefulness notes). No code impact. |
@@ -618,9 +618,9 @@ already documented; three were genuinely new — one a real flaw in the pass-6 M
 | **M-4** | Med | Pre-migration EOA-owner window could cement a bad config — resolved by transferring ownership to the timelock+multisig *before* setting/locking bindings (runbook). |
 | **L-6** | Low | Conversion sizing knobs intentionally NOT frozen by `lockRouting` — tuned to pool depth at go-live and may need ongoing tuning; owner-griefing is bounded/reversible, mitigated by the timelock. |
 | **L-8** | Low | `runDraw` reverting on an un-posted cohort tier beacon is fail-closed + retryable (no tickets consumed); a "skip" would consume the ticket for no payout. Keeper (`prep-draw.js`) posts all in-window beacons first. |
-| **L-12** | Low | `HolderDrawEngine` has no on-chain registry peer to constructor-cross-check `genesis`; cross-checked at deploy (`Deploy` asserts `HolderDraw.genesis() == Raffle.genesis()`, pass-6 L4). |
+| **L-12** | Low | `HolderDrawEngine` has no onchain registry peer to constructor-cross-check `genesis`; cross-checked at deploy (`Deploy` asserts `HolderDraw.genesis() == Raffle.genesis()`, pass-6 L4). |
 | **L-1/L-3/L-5** | Low | HolderDraw flash-hold (=H-5/F8), QUOTRON freeze no-rescue (=F3/L6), immutable oracle (=L5) — prior accepted residuals. |
-| L-4/L-7/L-9/I* | Low/Info | Adapter on-chain deadline (backstopped by `minOut`), renounce-before-wiring ordering (runbook), jackpot rollover-farming (Lead, needs live-data), + informationals — accepted/documented. |
+| L-4/L-7/L-9/I* | Low/Info | Adapter onchain deadline (backstopped by `minOut`), renounce-before-wiring ordering (runbook), jackpot rollover-farming (Lead, needs live-data), + informationals — accepted/documented. |
 
 *Local suite: **188 tests green** after pass-7 (+ regression tests: M-2 own-vault retry, L-10 cooldown, per-wallet cap). Two co-requested features — the NFT standing-entry model (Option B) and a launch-window buy cap+cooldown — were **deferred** at this pass: they materially change the raffle-draw / hook-swap paths and warrant dedicated design + test work, not a rushed pre-audit change. **Both are itemised in the "Out of scope — deliberately deferred" section near the top of this document, with what ships in their place. UPDATE: the buy cap + cooldown has since been BUILT** (`QpullTaxHook._throttleEarlyBuy`: the spec §16 launch throttle inside the 2-hour `GATE_DURATION()` window, §16.5); **only the standing-entry model still has no code, flag, or storage in this tree.***
 
@@ -730,7 +730,8 @@ wanted is stated. Disagreement with the reasoning is welcome; re-deriving the fa
 | 16.5 | Launch throttle: uncapped early-accumulation tail | Documented design ceiling | Accepted, immutable |
 | 16.6 | `lockRouting()` + write-once adapters are permanent | Immutability trade-off | Accepted; lock timing moved to the final verified go-live step |
 | 16.7 | Rip-XP claim window lets a holder pick one of two adjacent leaderboard weeks (M-2) | Negligible-value gameable choice | Accepted; comment corrected, code deliberately unchanged |
-| 16.8 | Pledge-flood against the free-entry pledge region (pre-audit LOW) | Bounded, non-profitable griefing | Accepted, bounded (void share `q^6` per seat, seats independent since the seat-nonce cascade fix); SR seats made immune by the SR-first pick; pruning the flood out of `wb` deferred to the external audit |
+| 16.8 | Pledge-flood against the free-entry pledge region (pre-audit LOW), plus FS-3b post-beacon pledge re-seating (full-stack audit) | Bounded, non-profitable griefing; FS-3b is bounded post-beacon selection | Accepted, bounded (void share `q^6` per seat, seats independent since the seat-nonce cascade fix); SR seats immune to the flood by the SR-first pick, and their membership frozen by the FS-3 fix; pruning the flood out of `wb` and closing **FS-3b** (pledge band still re-rolls on live ownership) deferred to the external audit |
+| 16.9 | Robinhood Chain censorship: ArbOS 61 tx filtering rejects even force-included txs, so no L1 forced-inclusion escape hatch | Inherent chain trust assumption | Accepted, unmitigable in code; bounds only liveness of a user's own tx (no fund loss), draws void-on-miss |
 
 ### 16.1 No pause, no circuit breaker, no kill switch (by design)
 
@@ -738,7 +739,7 @@ wanted is stated. Disagreement with the reasoning is welcome; re-deriving the fa
   `ClaimManager.claim` / `claimBatch`, and `BaseVault.payOut` carry no `whenNotPaused`, no owner gate, and no
   pause state anywhere. This is deliberate: a pause on the draw or claim path is itself a lever that freezes
   winners, which is exactly the capability the immutable-controller design exists to remove.
-- **Consequence, stated plainly for incident response: there is NO on-chain stop.** The ONLY operational lever
+- **Consequence, stated plainly for incident response: there is NO onchain stop.** The ONLY operational lever
   is `Treasury.setKeeper(k, false)`, which de-authorizes a convert keeper. That halts NEW `convert()` funding
   of the prize vaults and nothing else: already-funded vault balances, already-registered claims, and every
   permissionless draw keep running exactly as coded. Operators must not plan an incident around a stop that
@@ -821,7 +822,7 @@ wanted is stated. Disagreement with the reasoning is welcome; re-deriving the fa
   runs ONLY as the final go-live step, after (a) both convert caps are set, (b) LP is seeded through the lock,
   and (c) BOTH adapter legs (QPULL to WETH on the live canonical pool; WETH to QUOTRON via the live router)
   are fork-verified end-to-end. While routing is still open a bad binding can be corrected; after the lock it
-  cannot. The ordered steps and their on-chain post-conditions are `LAUNCH-CHECKLIST.md` §6b.
+  cannot. The ordered steps and their onchain post-conditions are `LAUNCH-CHECKLIST.md` §6b.
 - **The convert MEV caps are owner-mutable and intentionally NOT frozen by `lockRouting`.**
   `maxConvertPerCall` / `maxWethConvertPerCall` bound how much a single keeper call may push through each pool
   (keeper MEV and donation-brick, H-1 / H-3 / M-2) and must track pool depth over time. They cannot redirect
@@ -854,13 +855,55 @@ wanted is stated. Disagreement with the reasoning is welcome; re-deriving the fa
   copy that is rolled burns one of the seat's `MAX_REJECTS_PER_SEAT = 6` rolls and one of the draw's shared
   `MAX_VDRAW_ROLLS = 256`. The earlier code comment claimed the per-seat cap "kills the flood vector"; it
   bounds gas, not the flood. The comment is corrected in `src/PackRegistry.sol` (at `MAX_REJECTS_PER_SEAT`).
-- **Fix taken (decision 2a, contained): Super Rare seats are immune.** `_pickVirtual` now resolves the SR band
-  FIRST on every roll, before the shared budget is consulted and before `pledgeList` is read. An SR-band roll
-  is always valid, costs no budget, and can no longer be voided or pre-empted. Previously the budget check
+- **Fix taken (decision 2a, contained): Super Rare seats are immune to the flood.** `_pickVirtual` now resolves
+  the SR band FIRST on every roll, before the shared budget is consulted and before `pledgeList` is read. An
+  SR-band roll costs no budget and can never be voided or pre-empted **by a flood or a spent budget**.
+  Previously the budget check
   preceded a seat's first roll, so a spent budget voided SR autos too (and a seat that burnt the last roll
   voided instead of seating an SR on its next roll). Only the pledge region is budget-gated and validated. The
   pick stays a pure function of the beacon and frozen state (`previewDraw == drawFrom`; pinned by
   `PledgeFloodTest` in `test/NFTIntegration.t.sol`).
+  Note the precise scope after FS-3 (below): the claim is immunity to the flood and to the budget, NOT the
+  stronger "an SR seat is never voided". That pass's own owner can forfeit it by moving it after the freeze.
+- **Third fix (FS-3, full-stack audit): frozen Super Rare membership.** `_buildSrList` used to filter
+  membership on LIVE `ownerSince`/`ownerOf`. Because `ownerSince` is re-stamped on every transfer, moving a
+  pass after the freeze dropped it from the list, changing `srCount`, `wb` and the dense `srList` index map,
+  which re-rolled **every** seat. The beacon is public before the draw runs, so a holder of several Super
+  Rares could preview each candidate `srCount`, pick the arrangement that seated their remaining passes best,
+  and execute the transfers. Membership is now decided ONLY by `srRegisteredAt <= freeze` (write-once,
+  freeze-gated, and the scan is a prefix of an append-only array), so `srCount` / `srList` / `wb` are immutable
+  after the freeze; ownership is tested PER SEAT in `_pickVirtual` as a TERMINAL void that burns no budget.
+  **Guarantee, exactly:** a post-freeze transfer of a Super Rare can void that pass's own seats and can do
+  nothing else. It cannot move a win to a different pass, cannot change any other seat's occupant or roll
+  sequence, and cannot consume rejection budget. Anti-snipe is unchanged. **Not claimed:** unqualified
+  `preview == draw` (a preview before a move differs from a draw after it by exactly that pass's seats, and
+  `previewDraw` for an already-drawn day is unrelatedly unreliable). Pinned by `test/FreeEntryFreeze.t.sol`,
+  every test of which fails against the pre-fix code.
+- **Revised law.** With `S_all` the Super Rares registered at or before the freeze, `S_bad` of them moved after
+  it, `Pv` valid pledge weight, `F` invalid and `q = F/wb` over the frozen `wb = 8*S_all + Pv + F`:
+  `P(seated SR) = 8*(S_all-S_bad)/(8*S_all+Pv) * (1-q^6)`;
+  `P(seated valid pledge) = Pv/(8*S_all+Pv) * (1-q^6)`;
+  `P(void) = 8*S_bad/(8*S_all+Pv) * (1-q^6) + q^6`.
+  `S_bad = 0` recovers the originally published law exactly, so every measured number in this section still
+  stands (and every existing fixture has `S_bad = 0`, so any movement in them signals a mis-applied fix). The
+  8 : 4/2/1 ladder stays EXACT among seated seats. The new forfeit term is LINEAR in forfeited SR weight and
+  can be caused only by that pass's own owner, at the cost of their own highest-weight seats; the flood term
+  stays a sixth power.
+- **Correction to an earlier claim in this section.** A void does **not** "roll forward to the vault".
+  `RaffleEngine._payWinners` divides each tier bucket by its REALIZED winner count, so a void redistributes to
+  that bucket's surviving winners and reaches the vault only when a bucket empties. Non-profitability is
+  unaffected: an attacker holding `a` of a bucket's `c` winners moves from `a/c` to `(a-1)/(c-1)` by voiding
+  their own, and `(a-1)/(c-1) <= a/c` for all `a <= c`.
+- **OPEN, deferred to the external audit (FS-3b): the pledge band carries the same class of channel.**
+  `_pickVirtual` validates a pledged copy against LIVE ownership and **re-rolls** on failure, and a re-roll
+  re-samples the whole region, so moving a pledged pass after the beacon still re-seats that seat onto a
+  DIFFERENT token (handing it an extra win and shifting the VTIER of its later wins via `winIdx`). Smaller
+  blast radius than FS-3 (per-seat, no modulus reshuffle, and each toggle forfeits all of that pass's own
+  seats) but the same class. The obvious remedy (void instead of re-roll) would degrade the bound above from
+  `q^6` to `q`, roughly 1.6% to 50% of free seats voiding at `q = 0.5`, so it needs its own measurement and
+  sign-off rather than being folded into the FS-3 fix. Asserted as a residual by
+  `FreeEntryResidualTest` in `test/FreeEntryFreeze.t.sol`, which will fail (correctly) the day it is closed.
+  **Steering is therefore NOT removed protocol-wide; it is removed from the Super Rare band.**
 - **Second fix (re-verification): the seat-nonce cascade.** A re-verification of this section with real
   `drawFrom` calls found a PRE-EXISTING defect that made the flood far worse than the per-seat figure below.
   `_pickVirtual` keys every roll on `(beacon, day, 1, seat, roll)`, but `seat` advanced only when a seat was
@@ -907,12 +950,34 @@ wanted is stated. Disagreement with the reasoning is welcome; re-deriving the fa
   draw path (`_drawCore` / `_replayVirtual`). That is a design change for the auditors to weigh, not a
   pre-audit edit; the two contained fixes above (SR-first pick, independent seat nonces) are what ship.
 
+### 16.9 Robinhood Chain censorship: no L1 forced-inclusion escape hatch (inherent, unmitigable)
+
+- **The property.** Robinhood Chain is an Arbitrum Orbit L2 (chainId 4663) whose single sequencer is the sole
+  orderer of transactions. On a stock Arbitrum chain a censored user keeps an escape hatch: submit through the
+  L1 delayed inbox and force the transaction to be included after a bounded delay. That escape hatch does not
+  hold here. Robinhood Chain runs ArbOS 61 with transaction filtering that rejects even force-included
+  transactions, so a user whose transaction the sequencer refuses to sequence has no onchain route around it.
+  (This is distinct from the §16.2 `delaySeconds` back-dating residual and from the F12 ArbOS-61 note, which
+  covers only the 32M gas ceiling, not tx filtering.)
+- **QuoPull inherits it and cannot mitigate it in code.** The contracts are immutable and ownerless, but they
+  still execute on this one sequencer. What the property puts at risk is precisely and only the liveness of a
+  user's own transaction (a mint, a swap, a rip, or a permissionless draw or claim call). It cannot mint, move,
+  redirect, or seize any funds, and it hands no party a discretionary lever over any outcome.
+- **The app-level blast radius is bounded.** If the sequencer were to censor a draw or claim call across its
+  entire permissionless window, that window simply voids on miss and the pot rolls forward inside the vault
+  under the ordinary rules, exactly as it would if the keeper were absent. Nothing is re-rolled and no
+  alternative beacon can be selected. Because every draw and claim is permissionlessly callable, the user (or
+  anyone) can retry once the sequencer relents.
+- **Accepted as an inherent chain-level residual.** No application deployed on Robinhood Chain can remove this;
+  it is a known trust assumption of the underlying chain, documented here so it is read as such rather than as
+  a QuoPull defect.
+
 ---
 
 *This remediation was prepared with AI assistance and is not a substitute for an independent human security
 review. A dedicated cryptographic review of `BlsDrandOracle` and a **V4-hook specialist review of
 `QpullTaxHook`** remain recommended before mainnet. QUOTRON's ERC-404 semantics (M-6/M-8), Robinhood
-Chain's EIP-2537 support (H-4), and its sequencer `delaySeconds` (M-7) have all been verified on-chain /
+Chain's EIP-2537 support (H-4), and its sequencer `delaySeconds` (M-7) have all been verified onchain /
 against source and are addressed above; the residual QUOTRON-admin trust surface is documented and gated
 by the §9 launch check. Pass-4's F4 / pass-5's F6 (V4 liquidity-callback tax gap) is now **resolved** —
 liquidity provision is restricted to the protocol, with the gate covering both ADD and REMOVE after

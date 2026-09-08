@@ -76,6 +76,33 @@ contract MockNFT is INFTCollection {
         _rarity[id] = rarity_;
     }
 
+    /// @notice A REAL transfer, mirroring NFTCollection._update: it re-stamps `ownerSince`, which `set()`
+    ///         deliberately does not.
+    /// @dev    FS-3 harness prerequisite. `set()` stamps ownerSince only on an id's FIRST population, so
+    ///         re-calling it (which much of the suite uses as a stand-in for a transfer) moves the owner while
+    ///         leaving ownerSince frozen at the original stamp. Any test that tries to prove a post-freeze
+    ///         transfer changes eligibility would therefore pass VACUOUSLY, against fixed and unfixed code
+    ///         alike. Use this for anything that must behave like a real transfer.
+    ///         The `from == to` early return is load-bearing and mirrors the real collection: a self-transfer
+    ///         must NOT re-stamp, or every marketplace approval a holder has granted becomes a kill switch on
+    ///         their own free entries and holder-draw qualification.
+    ///         set() is left exactly as it was, so the pinned pledge-flood measurements keep their current
+    ///         pledgerOf-only invalidation semantics.
+    function transferTo(uint256 id, address to) external {
+        address from = _owner[id];
+        if (from == to) return; // self-transfer: no re-stamp, exactly like NFTCollection._update
+        if (from != address(0)) {
+            _bal[from] -= 1;
+            _restamp(from);
+        }
+        _owner[id] = to;
+        if (to != address(0)) {
+            _bal[to] += 1;
+            _restamp(to);
+        }
+        ownerSince[id] = uint64(block.timestamp);
+    }
+
     function ownerOf(uint256 id) external view returns (address) {
         return _owner[id];
     }

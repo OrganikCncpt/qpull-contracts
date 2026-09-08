@@ -83,7 +83,8 @@ contract RaiseToLaunchTest is Test {
         oracle = new MockDrandOracle(block.timestamp, 3);
         treasury = new Treasury(address(qpull), address(weth), address(quotron), address(this));
         rec = new MockRecorder();
-        nft = new NFTCollection(MINT_PRICE, address(oracle), 1 hours, address(new PassArtRenderer(address(this))), address(this));
+        PassArtRenderer _rndr = new PassArtRenderer(address(this)); _rndr.lock(); // preaudit: locked renderer required
+        nft = new NFTCollection(MINT_PRICE, address(oracle), 1 hours, address(_rndr), address(this));
         adapter = new QpullWethAdapter(address(manager), address(qpull), address(weth), address(this));
 
         QpullTaxHook.HookConfig memory hc = QpullTaxHook.HookConfig({

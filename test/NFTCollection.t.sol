@@ -53,7 +53,7 @@ contract ShortFallbackNFT is NFTCollection {
 contract NFTCollectionTest is Test {
     NFTCollection nft;
     MockDrandOracle oracle;
-    PassArtRenderer renderer; // empty renderer is fine here — these tests don't call tokenURI
+    PassArtRenderer renderer; // empty but LOCKED renderer is fine here — these tests don't call tokenURI
 
     address alice = makeAddr("alice");
     address lpTreasury = makeAddr("lpTreasury");
@@ -87,6 +87,7 @@ contract NFTCollectionTest is Test {
         vm.warp(GENESIS);
         oracle = new MockDrandOracle(GENESIS, 30);
         renderer = new PassArtRenderer(address(this));
+        renderer.lock(); // preaudit: NFTCollection now requires a locked renderer at construction
         _buildAllowlist();
         // Default fixture: the mint is started and time is advanced into the PUBLIC window, so the open path
         // (mint/mintBatch) is live and the per-wallet cap is PUBLIC_CAP. Tiered-window tests build their own

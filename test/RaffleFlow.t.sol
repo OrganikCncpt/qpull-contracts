@@ -474,6 +474,84 @@ contract RaffleFlowTest is Test {
         claimMgr.claim(1);
     }
 
+    // ─── FINDING #3 (INFO): worst-case gas of the COMBINED runDraw path ───────────────────────────────────
+    // The payout leg (_payWinners) is gas-tested at MAX_K in test/fork/QuotronWholeUnitFork.t.sol, but nothing
+    // snapshotted the SINGLE-TX cost of the whole runDraw = packs.drawFrom selection (the O(k) cohort loop +
+    // swap-pop over the full LIFE_DAYS window, src/PackRegistry.sol) PLUS _payWinners, at winnersPerDay = MAX_K,
+    // on a FULL cohort window. This measures that combined worst case end-to-end and encodes the one-block-safe
+    // invariant (< 30M, well under RH's ~32M per-tx ceiling). MEASURE ONLY — it changes no src and never
+    // touches MAX_K. runDraw gas is O(k): the selection loop runs exactly winnersPerDay times and the payout
+    // writes one claim per winner, so it is independent of how DEEP each cohort is beyond the K it must fill —
+    // a full 7-cohort window holding > MAX_K live paid tickets is the worst realistic input for the path.
+    function test_gas_runDraw_worstCase_maxK_fullWindow() public {
+        uint256 maxK = raffle.MAX_K(); // 200 — reachable ONLY at construction (setWinnersPerDay is ±25%/day)
+        uint32 life = packs.LIFE_DAYS(); // 7 — the window runDraw sweeps is cohorts [day-life .. day-1]
+
+        // Fresh stack deployed straight at K = MAX_K. potCap bounds each draw to a fixed 10k QUOTRON (gas is
+        // independent of the pot's magnitude) and the vault is funded far above it, so all K winners pay > 0
+        // and the reserve never exceeds free balance.
+        MockDrandOracle o = new MockDrandOracle(GENESIS, PERIOD);
+        PackRegistry p = new PackRegistry(address(o), TICKET, GENESIS, 1 hours, address(this));
+        BaseVault v = new BaseVault(address(quotron), address(this));
+        ClaimManager cm = new ClaimManager(address(this));
+        RaffleEngine r = new RaffleEngine(
+            address(o), address(p), address(v), address(cm), GENESIS, maxK, 1, 10_000e18, address(this)
+        );
+        p.setRecorder(token);
+        p.setEngine(address(r));
+        cm.setEngine(address(r), address(v));
+        v.setController(address(cm));
+        quotron.mint(address(v), 1_000_000e18);
+
+        // Draw day = LIFE_DAYS + 3 (=10): its window is cohorts [3..9] — a full LIFE_DAYS run of cohorts, all
+        // clear of the one-time opening sweep (which touches only [0, ACCUM_DAYS-1] = [0,1]).
+        uint32 drawDay = life + 3;
+        uint256 perCohort = 40; // life*40 = 280 live paid tickets > MAX_K, so the draw fills a full field of K
+
+        // cohort 0: seed the opening bootstrap (block.timestamp == GENESIS here → _today() == 0).
+        vm.prank(token);
+        p.recordBuy(alice, 10 * TICKET); // 10 tickets in cohort 0; the opening pops OPENING_WINNERS from [0,1]
+
+        // populate the full draw window [3 .. drawDay-1]
+        for (uint32 c = 3; c <= drawDay - 1; ++c) {
+            vm.warp(GENESIS + uint256(c) * DAY + 1); // _today() == c
+            vm.prank(token);
+            p.recordBuy(alice, perCohort * TICKET);
+        }
+
+        // reveal beacons: cohort 0 (opening payout) + each window cohort (day-`drawDay` payout tierOf).
+        // All packs in a cohort share ONE reveal round = roundAt(genesis + (cohort+1)*DAY + revealDelay).
+        o.setBeacon(o.roundAt(GENESIS + 1 * DAY + 1 hours), keccak256("rev0"));
+        for (uint32 c = 3; c <= drawDay - 1; ++c) {
+            o.setBeacon(o.roundAt(GENESIS + (uint256(c) + 1) * DAY + 1 hours), keccak256(abi.encode("rev", c)));
+        }
+
+        // one-time opening draw (unlocks the daily runDraw); sweeps [0,1] only, leaving [3..9] untouched.
+        o.setBeacon(r.drawRound(1), keccak256("opening")); // drawRound(ACCUM_DAYS-1)
+        r.runOpeningDraw();
+        assertTrue(r.openingDone(), "opening bootstrapped");
+
+        // day-`drawDay` settling beacon, then step into its ONLY draw window (the following day).
+        o.setBeacon(r.drawRound(drawDay), keccak256("draw"));
+        vm.warp(GENESIS + (uint256(drawDay) + 1) * DAY + 1); // currentDay() == drawDay + 1
+        assertEq(r.currentDay(), drawDay + 1, "in the void-on-miss window for the draw day");
+        assertEq(p.liveCount(drawDay), perCohort * life, "the full 7-cohort window is live");
+
+        // ── measure the single combined selection + payout tx ──
+        uint256 claimsBefore = cm.nextClaimId();
+        uint256 gasBefore = gasleft();
+        r.runDraw(drawDay);
+        uint256 gasUsed = gasBefore - gasleft();
+
+        // the number is only meaningful if a FULL field of K winners was actually selected AND paid this tx.
+        assertEq(cm.nextClaimId() - claimsBefore, maxK, "a full field of MAX_K winners selected and paid");
+        assertTrue(r.drawn(drawDay), "the draw day was consumed");
+
+        emit log_named_uint("runDraw combined worst-case gas (K=MAX_K, full 7-cohort window)", gasUsed);
+        // Encode the invariant: the combined selection+payout must fit one RH block (~32M) with margin.
+        assertLt(gasUsed, 30_000_000, "combined runDraw must stay under the ~32M per-tx ceiling");
+    }
+
     // ─── pre-audit: the paired DAY() cadence is cross-checked at construction (only genesis was before) ──
 
     function test_cadence_dayLengthExposesBaseCadence() public view {

@@ -45,6 +45,15 @@ contract BlsDrandOracleTest is Test {
         assertEq(sha256(abi.encodePacked(ROUND)), MSG, "msg = sha256(round_be8)");
     }
 
+    /// @notice finding #2: the constructor's fail-closed precompile gate now also probes SHA-256 (0x02) and
+    ///         MODEXP (0x05) — both hard dependencies of the beacon-verify path — alongside the three BLS
+    ///         precompiles. Under Foundry (evm_version = prague) all five exist, so the added probes must NOT
+    ///         false-revert: a successful construction (non-empty code) proves every probe passed.
+    function test_precompileGate_constructionSucceeds() public {
+        BlsDrandOracle o = new BlsDrandOracle(DRAND_GENESIS, DRAND_PERIOD);
+        assertGt(address(o).code.length, 0, "oracle deployed: all precompile probes (incl. SHA-256/MODEXP) passed");
+    }
+
     function test_hashToG1_matchesReference() public view {
         assertEq(oracle.hashToG1(MSG), H, "on-chain hash-to-G1 == py_ecc reference");
     }

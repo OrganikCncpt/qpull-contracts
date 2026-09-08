@@ -33,9 +33,9 @@ Immutables: `poolManager, qpull, weth, fee, tickSpacing, hook, opener`, full-ran
 
 `GoLiveTestnet` now: deployer `initialize`s the pool, then deploys `QpullLiquidityLock(opener = deployer)`, transfers the launch QPULL + WETH to it, and calls `lock.seed(liquidity)`. It reports the lock address.
 
-**Mainnet:** `script/GoLiveMainnet.s.sol` is the reviewed mainnet twin. It seeds **100% of supply** (the deployer's entire QPULL balance plus the LP WETH) through `QpullLiquidityLock` and enforces the post-conditions on-chain in the same broadcast: `lock.seeded() == true`, the position keyed `(lock, tickLower, tickUpper)` holds exactly `LP_LIQUIDITY` and equals the pool's whole liquidity, deployer residual QPULL `== 0`, and the residual stranded in the lock is `<= MAX_LOCK_RESIDUAL_BPS` per side (the script reverts otherwise). `LiquiditySeeder` is removed from the mainnet path (testnet-only if retained).
+**Mainnet:** `script/GoLiveMainnet.s.sol` is the reviewed mainnet twin. It seeds **100% of supply** (the deployer's entire QPULL balance plus the LP WETH) through `QpullLiquidityLock` and enforces the post-conditions onchain in the same broadcast: `lock.seeded() == true`, the position keyed `(lock, tickLower, tickUpper)` holds exactly `LP_LIQUIDITY` and equals the pool's whole liquidity, deployer residual QPULL `== 0`, and the residual stranded in the lock is `<= MAX_LOCK_RESIDUAL_BPS` per side (the script reverts otherwise). `LiquiditySeeder` is removed from the mainnet path (testnet-only if retained).
 
-## How to verify on-chain (the "can't rug" proof)
+## How to verify onchain (the "can't rug" proof)
 
 1. The lock's source has no remove/withdraw/collect/sweep function (read it).
 2. `lock.seeded() == true` and the pool holds the launch liquidity.
@@ -49,5 +49,5 @@ Immutables: `poolManager, qpull, weth, fee, tickSpacing, hook, opener`, full-ran
 ## Open
 
 - Adversarial review verdict (in flight) — must be clean before mainnet use.
-- **CLOSED (2026-09-07):** mainnet go-live script adopts the lock — `script/GoLiveMainnet.s.sol` seeds 100% of supply through `QpullLiquidityLock` with the on-chain post-conditions listed above (pre-audit MEDIUM "go-live omits the lock").
-- **CLOSED (2026-09-07):** deployer residual QPULL `== 0` post-seed is asserted on-chain by `GoLiveMainnet` (`require`, not a checklist read-back) and is also a pinned gate + `LAUNCH-CHECKLIST.md` §6b step 3 post-condition.
+- **CLOSED (2026-09-07):** mainnet go-live script adopts the lock — `script/GoLiveMainnet.s.sol` seeds 100% of supply through `QpullLiquidityLock` with the onchain post-conditions listed above (pre-audit MEDIUM "go-live omits the lock").
+- **CLOSED (2026-09-07):** deployer residual QPULL `== 0` post-seed is asserted onchain by `GoLiveMainnet` (`require`, not a checklist read-back) and is also a pinned gate + `LAUNCH-CHECKLIST.md` §6b step 3 post-condition.

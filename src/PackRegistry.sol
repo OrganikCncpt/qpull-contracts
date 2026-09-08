@@ -128,12 +128,24 @@ contract PackRegistry is IPackRegistry, NonRenounceableOwnable2Step {
     // Per-seat pledge-rejection sub-cap. It bounds GAS, not the flood (pre-audit LOW "pledge-flood", decision 2a,
     // SECURITY.md 16.8). pledgeList is append-only and a copy is voided only when it is rolled, so an owner who
     // pledges passes and then transfers them away (no re-pledge) leaves INVALID weight F in the sampling region
-    // wb = 8s + Pv + F (s eligible Super Rares at SR_WEIGHT, Pv valid pledge weight). Bound per free seat, with
-    // q = F / wb the invalid fraction (each roll lands SR / valid / invalid independently and the seat resolves
-    // on its first non-invalid roll within this cap):
-    //   P(seated SR) = 8s/(8s+Pv) * (1 - q^6)   P(seated valid pledge) = Pv/(8s+Pv) * (1 - q^6)   P(void) = q^6
-    // So the 8 : 4/2/1 ladder is EXACT among seated seats and the flood's only lever is the void share q^6
-    // (rolls forward to the vault, never to the flooder): 1.6% at q=0.5, 26% at q=0.8, 53% at q=0.9, and
+    // wb = 8*S_all + Pv + F, where S_all is the Super Rares REGISTERED at or before the freeze (FS-3: membership
+    // is frozen, so wb cannot move after the freeze), S_bad of them have changed hands since the freeze, Pv is
+    // valid pledge weight and F invalid. Per roll the four outcomes are: 8*(S_all-S_bad)/wb seats an SR
+    // (terminal), 8*S_bad/wb VOIDS terminally burning NO budget (the FS-3 forfeit), Pv/wb seats a valid pledge
+    // (terminal), and q = F/wb rejects and re-rolls. Over the six-roll cap:
+    //   P(seated SR)          = 8*(S_all-S_bad)/(8*S_all+Pv) * (1 - q^6)
+    //   P(seated valid pledge)= Pv/(8*S_all+Pv)              * (1 - q^6)
+    //   P(void)               = 8*S_bad/(8*S_all+Pv) * (1 - q^6)  +  q^6
+    // S_bad = 0 recovers the originally shipped law EXACTLY, so every pinned measurement below still stands.
+    // The 8 : 4/2/1 ladder is EXACT among seated seats (it is 8*(S_all-S_bad) : Pv and contains no void term),
+    // and diverting forfeited SR weight to void does NOT redistribute between bands. Note the two void terms
+    // differ in kind: the forfeit term is LINEAR in forfeited SR weight and can be caused ONLY by that pass's
+    // own owner moving it (at the cost of their own highest-weight seats), while the flood term stays a sixth
+    // power. A forfeited seat does not "roll forward to the vault": RaffleEngine._payWinners divides each tier
+    // bucket by its REALIZED winner count, so a void redistributes to that bucket's surviving winners and only
+    // reaches the vault when a bucket empties. Non-profitability is unchanged: an attacker holding a of a
+    // bucket's c winners moves from a/c to (a-1)/(c-1) by voiding their own, and (a-1)/(c-1) <= a/c for a <= c.
+    // The flood's only lever remains the void share q^6: 1.6% at q=0.5, 26% at q=0.8, 53% at q=0.9, and
     // q=0.9 costs F = 9x the honest weight (against 30 SR alone: ~540 Rares or ~2,160 Commons held and
     // pledged-then-transferred, i.e. most of the supply).
     // SEATS ARE INDEPENDENT (cascade fix): this per-seat figure is ALSO the expected lost share of the whole
@@ -143,9 +155,13 @@ contract PackRegistry is IPackRegistry, NonRenounceableOwnable2Step {
     // the IDENTICAL six values against unchanged storage at every later virtual slot and voided again: ONE
     // void ended the free block for the rest of the draw, and the measured lost share of the free block was
     // 16% / 85% / 96% at q = 0.5 / 0.8 / 0.9, not q^6. With independent seats a void costs exactly that seat.
-    // SR-band rolls are immune to the BUDGET: _pickVirtual resolves them before it, so a flood can never void a
-    // seat that rolled SR. Pruning F out of wb (the deeper rework) is deliberately deferred to the external
-    // audit.
+    // SR-band rolls are immune to the FLOOD and to the shared BUDGET: _pickVirtual resolves them before both,
+    // so no number of invalid pledge copies and no spent budget can ever void or pre-empt a seat that rolled
+    // SR. That is the precise claim; the stronger reading "a seat that rolled SR is never voided" is FALSE
+    // since FS-3, because that pass's own owner can forfeit it by moving it after the freeze. Pruning F out of
+    // wb (the deeper rework) is deliberately deferred to the external audit, as is FS-3b (the pledge band still
+    // validates on live ownership and RE-ROLLS, so moving a pledged pass after the beacon re-seats that seat
+    // onto a different token; voiding it instead would degrade q^6 to q, so it needs its own sign-off).
     uint256 internal constant MAX_REJECTS_PER_SEAT = 6;
     uint256 public constant SAFE_FREE_K = 150; // winnersPerDay ≤ this ships with full gas margin (else gas-test)
     uint256 public constant SR_WEIGHT = 8; // Super Rare draw weight (ladder Common 1 / Uncommon 2 / Rare 4 / SR 8)
@@ -267,11 +283,12 @@ contract PackRegistry is IPackRegistry, NonRenounceableOwnable2Step {
         emit MaxTicketsPerBuySet(m);
     }
 
-    /// @notice Re-peg the ticket price to hold ~$10 of QPULL per ticket as QPULL's market price drifts
-    ///         (spec §13.4). Deliberately constrained — at most ±25% per change and at most once per day
-    ///         — so the knob can never mint-farm (price→0) or brick (price→∞) the raffle, and every move
-    ///         is slow and observable. The owner (ideally a timelock/multisig) computes the QPULL amount
-    ///         currently worth ~$10 off-chain and sets it within these bounds. No price is read on-chain.
+    /// @notice Re-peg the ticket price to hold ~$10 of ETH-in VALUE per ticket as ETH's USD price drifts
+    ///         (spec §13.4). `newPrice` is WETH wei (the same denomination as `ticketPrice`, see :52-60), NOT
+    ///         QPULL. Deliberately constrained — at most ±25% per change and at most once per day — so the
+    ///         knob can never mint-farm (price→0) or brick (price→∞) the raffle, and every move is slow and
+    ///         observable. The owner (ideally a timelock/multisig) computes the WETH amount currently worth
+    ///         ~$10 off-chain and sets it within these bounds. No price is read on-chain.
     function setTicketPrice(uint256 newPrice) external onlyOwner {
         if (newPrice == 0) revert TicketPriceZero();
         if (block.timestamp < uint256(lastTicketAdjust) + ADJUST_COOLDOWN) revert AdjustTooSoon();
@@ -473,9 +490,28 @@ contract PackRegistry is IPackRegistry, NonRenounceableOwnable2Step {
         emit Drawn(drawDay, got);
     }
 
-    /// @dev Build the in-memory list of Super Rare passes eligible for a draw (held before `freeze`).
-    ///      Iterates ONLY the SR index (bounded by MAX_SR_SCAN), never the full token space, and never calls
-    ///      rarityOf (SR-ness is the index), so the draw is reveal-independent and one bad token can't brick it.
+    /// @dev Build the in-memory list of Super Rare passes ENTERED in a draw: every indexed id REGISTERED at or
+    ///      before `freeze`. Iterates ONLY the SR index (bounded by MAX_SR_SCAN), never the full token space,
+    ///      and never calls rarityOf (SR-ness is the index), so the draw is reveal-independent and one bad
+    ///      token can't brick it. Makes no external call at all.
+    ///
+    ///      MEMBERSHIP IS FROZEN, AND THAT IS THE POINT (FS-3). `srRegisteredAt` is written once per id
+    ///      (registerSuperRare skips an already-indexed id, :315), `superRareIds` is append-only (:320), and
+    ///      `srRegisteredAt` is therefore non-decreasing along it, so this filter selects a PREFIX and the
+    ///      compaction is the identity map. After the freeze neither the contents, nor the order, nor srCount
+    ///      can change. That is what holds `cfg.wb` and the `srList` index mapping still, and therefore every
+    ///      seat, against any post-beacon transfer.
+    ///
+    ///      OWNERSHIP IS DELIBERATELY NOT TESTED HERE. It is live-mutable: `ownerSince` is re-stamped on every
+    ///      transfer, so filtering on it here re-compacted the list, changed srCount and wb, and re-rolled
+    ///      EVERY seat. Since the beacon is public before the draw runs, a holder of several Super Rares could
+    ///      preview each candidate srCount and move their own passes to select a favourable seating (FS-3).
+    ///      Eligibility is now tested PER SEAT in _pickVirtual instead, as a terminal void.
+    ///
+    ///      WARNING: any future code that reorders, inserts into, or removes from `superRareIds`, or that
+    ///      re-introduces a live-state filter here, silently re-creates FS-3.
+    ///      Note also that ids past index MAX_SR_SCAN are permanently and silently excluded from every draw
+    ///      (~60 Super Rares expected at a 3k mint, so there is headroom, but the cut is permanent).
     function _buildSrList(uint256 freeze) internal view returns (uint256[] memory srList, uint256 srCount) {
         uint256 n = superRareIds.length;
         if (n > MAX_SR_SCAN) n = MAX_SR_SCAN;
@@ -484,9 +520,6 @@ contract PackRegistry is IPackRegistry, NonRenounceableOwnable2Step {
             uint256 tid = superRareIds[i];
             uint64 ra = srRegisteredAt[tid];
             if (ra == 0 || uint256(ra) > freeze) continue; // registered after this draw's freeze (beacon already public) — not this draw (finding-1)
-            uint64 os = nft.ownerSince(tid);
-            if (os == 0 || uint256(os) > freeze) continue; // never held, or acquired after the freeze
-            if (_safeOwnerOf(tid) == address(0)) continue;
             srList[srCount++] = tid;
         }
     }
@@ -513,18 +546,31 @@ contract PackRegistry is IPackRegistry, NonRenounceableOwnable2Step {
 
     /// @dev Resolve one virtual free seat: weighted pick over Super Rare (weight SR_WEIGHT each) + the
     ///      weight-expanded pledge copies, repeats allowed. Shared by drawFrom (commit) and previewDraw (view);
-    ///      a pure function of (beacon, day, seat, frozen state), so preview == draw. Returns the running shared
+    ///      a pure function of (beacon, day, seat, frozen state), so preview == draw WITHIN THE DRAW WINDOW and
+    ///      up to forfeiture (see the guarantee note below). Returns the running shared
     ///      rejection count so the caller threads it, and tid == NOT_SEATED (type(uint256).max, never a real
-    ///      token id) when the seat voids (rolls forward). `seat` is the caller's virtual SLOT index, advanced
+    ///      token id) when the seat voids. A seat voids for exactly three reasons: six pledge rejections, a
+    ///      spent shared budget, or (FS-3) an SR whose pass changed hands after the freeze. `seat` is the
+    ///      caller's virtual SLOT index, advanced
     ///      by the caller on a void as well as on a fill, so no two slots of a draw ever share a roll key and a
     ///      void never repeats at the next slot (cascade fix, MAX_REJECTS_PER_SEAT).
     ///
+    ///      THE FS-3 GUARANTEE, stated exactly: a post-freeze transfer of a Super Rare can void that pass's own
+    ///      seats and can do nothing else. It cannot move a win to a different pass, cannot change any other
+    ///      seat's occupant or roll sequence, and cannot consume any rejection budget. Anti-snipe is unchanged:
+    ///      a pass acquired after the freeze can never be paid. NOT claimed: unqualified "preview == draw"
+    ///      (a preview taken before a pass moves differs from a draw run after it by exactly that pass's seats),
+    ///      and the pledge band is NOT covered (FS-3b: it still validates on live ownership and re-rolls).
+    ///
     ///      Pick order (pre-audit LOW "pledge-flood", decision 2a, SR FIRST, contained): on EVERY roll the
     ///      Super Rare band [0, srWeightTotal) is resolved BEFORE the shared budget is consulted and BEFORE
-    ///      pledgeList is read. SR autos are always valid, so an SR-band roll is seated unconditionally: it
-    ///      costs no budget, and neither a spent budget nor any number of invalid pledge copies can void or
+    ///      pledgeList is read. An SR-band roll resolves from FROZEN membership and costs no budget; it seats
+    ///      if that pass has not changed hands since the freeze, and otherwise voids that seat TERMINALLY.
+    ///      Neither a spent budget nor any number of invalid pledge copies can void or
     ///      pre-empt it (the budget check no longer precedes the seat's first roll, which used to void SR seats
-    ///      too). Only a roll that lands in the pledge region is budget-gated and validated (a transfer voids
+    ///      too); only that pass's own owner can, by moving it. The SR void is terminal rather than a re-roll
+    ///      because a re-roll re-samples the whole region and would redirect the seat onto a different token,
+    ///      which is precisely the FS-3 attack. Only a roll that lands in the pledge region is budget-gated and validated (a transfer voids
     ///      the pledge); an invalid copy burns one shared roll and the seat re-rolls over the WHOLE region,
     ///      which is what keeps the 8 : 4/2/1 ladder exact among seated seats (bound at MAX_REJECTS_PER_SEAT).
     ///      If the shared budget is ever spent (needs >= 43 fully-rejecting free seats in ONE draw, while a
@@ -541,8 +587,24 @@ contract PackRegistry is IPackRegistry, NonRenounceableOwnable2Step {
         uint256 srWeightTotal = cfg.srCount * SR_WEIGHT;
         for (uint256 roll; roll < MAX_REJECTS_PER_SEAT; ++roll) {
             uint256 x = uint256(keccak256(abi.encode(beacon, day, uint256(1), seat, roll))) % cfg.wb;
-            // 1. Super Rare band FIRST: always valid, budget-free, pledgeList never read.
-            if (x < srWeightTotal) return (cfg.srList[x % cfg.srCount], rejectsOut);
+            // 1. Super Rare band FIRST: resolved from FROZEN membership, budget-free, pledgeList never read.
+            //    The pass seats if it has not changed hands since the freeze; otherwise this seat VOIDS.
+            //    The void is TERMINAL (no re-roll) and burns NO budget, and both properties are load-bearing:
+            //      * terminal, because a re-roll re-samples the WHOLE region on the next roll (:544-546), so it
+            //        would redirect the seat onto a different token, hand that token an extra win, bump its
+            //        winIdx (_tidWinIndex) and re-roll the VTIER of its later wins. That redirect IS the FS-3
+            //        attack; only a destruction removes it. Do not "simplify" this into a re-roll.
+            //      * budget-free, because this branch returns BEFORE the budget gate below, so a flood can
+            //        still never void or pre-empt a seat that rolled Super Rare (SECURITY.md 16.8 holds
+            //        literally). Only that pass's OWN owner can void it, by moving it, and only their own seat.
+            //    The `sos == 0` clause preserves the exact semantics of the membership filter it replaced:
+            //    `<= freeze` alone would treat an unstamped id as eligible.
+            if (x < srWeightTotal) {
+                uint256 srTid = cfg.srList[x % cfg.srCount];
+                uint64 sos = nft.ownerSince(srTid);
+                if (sos == 0 || uint256(sos) > cfg.freeze) return (NOT_SEATED, rejectsOut);
+                return (srTid, rejectsOut);
+            }
             // 2. Pledge region: gated by the shared budget. A spent budget voids THIS pledge attempt only.
             if (rejectsOut >= MAX_VDRAW_ROLLS) return (NOT_SEATED, rejectsOut);
             uint256 cand = pledgeList[day][x - srWeightTotal];

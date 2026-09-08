@@ -3,6 +3,7 @@ pragma solidity 0.8.26;
 
 import { Test } from "forge-std/Test.sol";
 import { NFTCollection } from "../../src/NFTCollection.sol";
+import { PassArtRenderer } from "../../src/nft/PassArtRenderer.sol";
 import { MockDrandOracle } from "../mocks/MockDrandOracle.sol";
 
 /// @notice delegate.xyz v2 registry, write side. `checkDelegateForContract` is what NFTCollection reads;
@@ -61,7 +62,8 @@ contract DelegatedMintForkTest is Test {
         require(REGISTRY.code.length > 0, "delegate.xyz v2 registry is not deployed on this chain");
 
         oracle = new MockDrandOracle(block.timestamp, 3);
-        nft = new NFTCollection(PRICE, address(oracle), 1 hours, address(0xBEEF), address(this));
+        PassArtRenderer _rndr = new PassArtRenderer(address(this)); _rndr.lock(); // preaudit: locked renderer required (was address(0xBEEF))
+        nft = new NFTCollection(PRICE, address(oracle), 1 hours, address(_rndr), address(this));
         nft.setRecipients(address(this), makeAddr("seed"), makeAddr("team"));
         nft.setDelegateRegistry(REGISTRY); // wire the REAL registry, not a mock
         nft.setMintOpen(true);
