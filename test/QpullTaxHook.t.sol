@@ -13,6 +13,8 @@ import { Currency as V4Currency } from "v4-core/types/Currency.sol";
 import { BalanceDelta as V4BalanceDelta } from "v4-core/types/BalanceDelta.sol";
 import { PoolSwapTest } from "v4-core/test/PoolSwapTest.sol";
 import { PoolModifyLiquidityTest } from "v4-core/test/PoolModifyLiquidityTest.sol";
+import { CustomRevert } from "v4-core/libraries/CustomRevert.sol";
+import { Hooks } from "v4-core/libraries/Hooks.sol";
 
 // ─── ours ────────────────────────────────────────────────────────────────────────────────
 import { QpullTaxHook } from "../src/hooks/QpullTaxHook.sol";
@@ -24,7 +26,6 @@ import {
     BalanceDelta as OurBalanceDelta
 } from "../src/interfaces/IPoolManager.sol";
 import { PackRegistry } from "../src/PackRegistry.sol";
-import { JackpotRegistry } from "../src/JackpotRegistry.sol";
 import { LeaderboardRegistry } from "../src/LeaderboardRegistry.sol";
 import { MockERC20 } from "./mocks/MockERC20.sol";
 import { MockNFT } from "./mocks/MockNFT.sol";
@@ -52,7 +53,6 @@ contract QpullTaxHookTest is Test {
     MockERC20 weth;
     MockNFT nft;
     MockRecorder packRec;
-    MockRecorder jackpotRec;
     MockRecorder boardRec;
 
     QpullTaxHook hook;
@@ -77,7 +77,6 @@ contract QpullTaxHookTest is Test {
         qpullIs0 = address(qpull) < address(weth);
         nft = new MockNFT();
         packRec = new MockRecorder();
-        jackpotRec = new MockRecorder();
         boardRec = new MockRecorder();
 
         alice = makeAddr("alice");
@@ -90,7 +89,7 @@ contract QpullTaxHookTest is Test {
 
         deployCodeTo(
             "src/hooks/QpullTaxHook.sol:QpullTaxHook",
-            abi.encode(_cfg(address(packRec), address(jackpotRec), address(boardRec), address(adapter))),
+            abi.encode(_cfg(address(packRec), address(boardRec), address(adapter))),
             hookAddr
         );
         hook = QpullTaxHook(hookAddr);
@@ -126,7 +125,7 @@ contract QpullTaxHookTest is Test {
         liqRouter.modifyLiquidity(key, IV4PoolManager.ModifyLiquidityParams(FULL_LO, FULL_HI, 1e24, 0), "");
     }
 
-    function _cfg(address p, address j, address b, address exempt)
+    function _cfg(address p, address b, address exempt)
         internal
         view
         returns (QpullTaxHook.HookConfig memory)
@@ -139,11 +138,13 @@ contract QpullTaxHookTest is Test {
             tickSpacing: TICK_SPACING,
             treasury: feeSink,
             packRegistry: p,
-            jackpotRegistry: j,
             leaderboardRegistry: b,
             nft: address(nft),
             exemptSender: exempt,
-            initializer: address(this)
+            initializer: address(this),
+            // First-hour buy-size cap left effectively off in this fixture: the existing gate tests buy
+            // 1e21 inside the window, and the throttle deserves its own dedicated suite.
+            earlyBuyCapWei: type(uint256).max
         });
     }
 
@@ -163,6 +164,11 @@ contract QpullTaxHookTest is Test {
 
     function _pastGate() internal {
         vm.warp(block.timestamp + hook.GATE_DURATION() + 1);
+    }
+
+    // Warp past the 48h sell-tax decay window so sells settle at the flat 4% floor (and past the gate).
+    function _pastSellDecay() internal {
+        vm.warp(hook.launchTime() + hook.SELL_DECAY() + 1);
     }
 
     // ─── wiring sanity ───────────────────────────────────────────────────────
@@ -252,7 +258,7 @@ contract QpullTaxHookTest is Test {
         address hook2Addr = address(uint160((0xBB << 16) | FLAGS));
         deployCodeTo(
             "src/hooks/QpullTaxHook.sol:QpullTaxHook",
-            abi.encode(_cfg(address(packRec), address(jackpotRec), address(boardRec), address(adapter))),
+            abi.encode(_cfg(address(packRec), address(boardRec), address(adapter))),
             hook2Addr
         );
         V4PoolKey memory k2 = key;
@@ -280,7 +286,7 @@ contract QpullTaxHookTest is Test {
     }
 
     function test_sellExactIn_taxedInWeth() public {
-        _pastGate();
+        _pastSellDecay(); // sells decay 20%->4% over 48h; assert the 4% floor past the window
         uint256 amountIn = 1e21;
         uint256 before = weth.balanceOf(alice);
         _swap(alice, !_buyZeroForOne(), -int256(amountIn)); // sell exactly 1e21 QPULL
@@ -307,7 +313,7 @@ contract QpullTaxHookTest is Test {
     }
 
     function test_sellExactOut_taxedInQpull() public {
-        _pastGate();
+        _pastSellDecay(); // sells decay 20%->4% over 48h; assert the 4% floor past the window
         uint256 wantOut = 1e21;
         uint256 qBefore = qpull.balanceOf(alice);
         _swap(alice, !_buyZeroForOne(), int256(wantOut)); // receive exactly 1e21 WETH
@@ -343,29 +349,35 @@ contract QpullTaxHookTest is Test {
 
     // ─── registry fan-out ────────────────────────────────────────────────────
 
-    function test_buyNotifiesAllThree_creditedToSigner() public {
+    function test_buyNotifiesPackAndBoard_creditedToSigner() public {
         _pastGate();
-        uint256 before = qpull.balanceOf(alice);
+        // Game credit is priced off the ETH-in side of the trade (grossWeth), not the QPULL amount.
+        // On an exact-in buy of 1e21 WETH the pool consumes exactly 1e21 WETH and no WETH fee is
+        // taken on a buy, so the recorded gross == the WETH spent. The standalone jackpot registry is
+        // gone: buys now notify exactly the pack and leaderboard registries.
+        uint256 wBefore = weth.balanceOf(alice);
         _swap(alice, _buyZeroForOne(), -1e21);
-        uint256 gross = (qpull.balanceOf(alice) - before) + qpull.balanceOf(feeSink); // pre-fee output
+        uint256 grossWeth = wBefore - weth.balanceOf(alice);
 
         assertEq(packRec.calls(), 1, "pack notified");
         assertEq(packRec.lastTrader(), alice, "credited to tx.origin");
-        assertEq(packRec.lastGross(), gross, "gross = pre-fee QPULL volume");
+        assertEq(packRec.lastGross(), grossWeth, "gross = WETH-in volume");
         assertEq(boardRec.calls(), 1, "leaderboard notified");
         assertEq(boardRec.lastTrader(), alice, "leaderboard trader");
-        assertEq(jackpotRec.calls(), 1, "jackpot notified");
-        assertEq(jackpotRec.lastGross(), gross, "jackpot gross");
+        assertEq(boardRec.lastGross(), grossWeth, "leaderboard gross = WETH-in volume");
     }
 
-    function test_sellNotifiesJackpotOnly() public {
+    function test_sellRecordsNothingGameSide() public {
         _pastGate();
+        // Sells are taxed (the fee arrives in WETH) but record NOTHING game-side: the standalone
+        // jackpot game that used to take sell entries is deleted, and the hook only ever credits the
+        // pack + leaderboard registries on BUYS. The sell tax funds the games purely via Treasury.convert().
+        uint256 wBefore = weth.balanceOf(alice);
         _swap(alice, !_buyZeroForOne(), -1e21);
+        assertGt(weth.balanceOf(feeSink) + (weth.balanceOf(alice) - wBefore), 0, "sell executed"); // sanity
+        assertGt(weth.balanceOf(feeSink), 0, "sell still taxed in WETH");
         assertEq(packRec.calls(), 0, "no pack tickets on sells");
-        assertEq(boardRec.calls(), 0, "no points on sells");
-        assertEq(jackpotRec.calls(), 1, "jackpot records sells");
-        assertEq(jackpotRec.lastTrader(), alice, "jackpot trader");
-        assertEq(jackpotRec.lastGross(), 1e21, "gross = QPULL paid in");
+        assertEq(boardRec.calls(), 0, "no leaderboard points on sells");
     }
 
     /// The hook is immutable: a faulting registry must cost only that trade's rewards — the swap and
@@ -373,7 +385,6 @@ contract QpullTaxHookTest is Test {
     function test_registryRevertNeverBlocksTrading() public {
         _pastGate();
         packRec.setRevert(true);
-        jackpotRec.setRevert(true);
         boardRec.setRevert(true);
 
         uint256 before = qpull.balanceOf(alice);
@@ -400,7 +411,8 @@ contract QpullTaxHookTest is Test {
         assertEq(weth.balanceOf(sink), out, "full output delivered - no 4% skim");
         assertEq(weth.balanceOf(feeSink), 0, "no fee");
         assertEq(qpull.balanceOf(feeSink), 0, "no fee");
-        assertEq(jackpotRec.calls(), 0, "no records for protocol conversions");
+        assertEq(packRec.calls(), 0, "no records for protocol conversions");
+        assertEq(boardRec.calls(), 0, "no records for protocol conversions");
     }
 
     // ─── adapter poolKey binding ─────────────────────────────────────────────
@@ -418,7 +430,7 @@ contract QpullTaxHookTest is Test {
         address hook3Addr = address(uint160((0xCC << 16) | FLAGS));
         deployCodeTo(
             "src/hooks/QpullTaxHook.sol:QpullTaxHook",
-            abi.encode(_cfg(address(packRec), address(jackpotRec), address(boardRec), makeAddr("other"))),
+            abi.encode(_cfg(address(packRec), address(boardRec), makeAddr("other"))),
             hook3Addr
         );
         PoolKey memory k = _ourKey();
@@ -427,23 +439,80 @@ contract QpullTaxHookTest is Test {
         adapter.setPoolKey(k);
     }
 
+    // ─── pool-init gate: mint must be closed first (MintStillOpen) ─────────────
+
+    /// afterInitialize refuses to open the canonical pool until the NFT collection is launched()
+    /// (finalizeLaunch). Asserts the TYPED MintStillOpen selector through v4-core's ERC-7751 wrapping,
+    /// not a bare expectRevert().
+    function test_MintStillOpen_poolInitRevertsUntilNftLaunched() public {
+        address hAddr = address(uint160((0xEE << 16) | FLAGS));
+        deployCodeTo(
+            "src/hooks/QpullTaxHook.sol:QpullTaxHook",
+            abi.encode(_cfg(address(packRec), address(boardRec), address(adapter))),
+            hAddr
+        );
+        nft.setLaunched(false); // mint still open -> the pool cannot be created yet
+
+        V4PoolKey memory k2 = key;
+        k2.hooks = IV4Hooks(hAddr);
+        // sender == initializer (this) and the key is canonical, so afterInitialize reaches the launched() gate
+        vm.expectRevert(
+            abi.encodeWithSelector(
+                CustomRevert.WrappedError.selector,
+                hAddr,
+                IV4Hooks.afterInitialize.selector,
+                abi.encodeWithSelector(QpullTaxHook.MintStillOpen.selector),
+                abi.encodeWithSelector(Hooks.HookCallFailed.selector)
+            )
+        );
+        manager.initialize(k2, SQRT_1_1);
+    }
+
+    /// Once the mint is closed the same pool initializes cleanly (the gate is launch-only).
+    function test_MintStillOpen_poolInitSucceedsOnceLaunched() public {
+        address hAddr = address(uint160((0xEF << 16) | FLAGS));
+        deployCodeTo(
+            "src/hooks/QpullTaxHook.sol:QpullTaxHook",
+            abi.encode(_cfg(address(packRec), address(boardRec), address(adapter))),
+            hAddr
+        );
+        nft.setLaunched(true);
+        V4PoolKey memory k2 = key;
+        k2.hooks = IV4Hooks(hAddr);
+        manager.initialize(k2, SQRT_1_1); // no revert
+        assertEq(QpullTaxHook(hAddr).launchTime(), block.timestamp, "launchTime stamped on a launched pool");
+    }
+
+    /// Tightened twin of test_gate_blocksNonHolderBuysFirstHour: assert the TYPED Gated selector
+    /// through v4-core's ERC-7751 wrapping (the swap dispatches afterSwap, which reverts Gated).
+    function test_gate_blocksNonHolderBuysFirstHour_typedSelector() public {
+        vm.expectRevert(
+            abi.encodeWithSelector(
+                CustomRevert.WrappedError.selector,
+                hookAddr,
+                IV4Hooks.afterSwap.selector,
+                abi.encodeWithSelector(QpullTaxHook.Gated.selector),
+                abi.encodeWithSelector(Hooks.HookCallFailed.selector)
+            )
+        );
+        _swap(sniper, _buyZeroForOne(), -1e21);
+    }
+
     // ─── real registries end-to-end ──────────────────────────────────────────
 
-    /// One full-path check with the REAL registries (not mocks): swap -> hook -> tickets/points/entries.
+    /// One full-path check with the REAL registries (not mocks): swap -> hook -> tickets/points.
     function test_realRegistriesRecordThroughHook() public {
         MockDrandOracle oracle = new MockDrandOracle(block.timestamp, 3);
         PackRegistry packs = new PackRegistry(address(oracle), 1e20, block.timestamp, 1 hours, address(this));
-        JackpotRegistry jack = new JackpotRegistry(block.timestamp, address(this));
         LeaderboardRegistry board = new LeaderboardRegistry(block.timestamp, address(this));
 
         address hook4Addr = address(uint160((0xDD << 16) | FLAGS));
         deployCodeTo(
             "src/hooks/QpullTaxHook.sol:QpullTaxHook",
-            abi.encode(_cfg(address(packs), address(jack), address(board), address(adapter))),
+            abi.encode(_cfg(address(packs), address(board), address(adapter))),
             hook4Addr
         );
         packs.setRecorder(hook4Addr);
-        jack.setRecorder(hook4Addr);
         board.setRecorder(hook4Addr);
 
         V4PoolKey memory k4 = key;
@@ -465,10 +534,131 @@ contract QpullTaxHookTest is Test {
 
         assertGt(packs.paidToday(packs.today()), 0, "raffle tickets minted");
         assertGt(board.totalPoints(board.currentWeek()), 0, "leaderboard points accrued");
-        assertGt(jack.periodTotal(jack.currentPeriod()), 0, "jackpot entries recorded");
+    }
+
+    // ─── launch sell-tax schedule: shipped ladder unchanged + saturation at TAX_BPS (pre-audit) ─────
+
+    /// The SHIPPED mainnet schedule (48h decay, 12h step) is exactly what it was before the saturating
+    /// rewrite of afterSwap: 2000 / 1600 / 1200 / 800 bps at steps 0..3 (the last second of the window
+    /// is still step 3), then the flat 400 once the window closes. Saturation never engages here.
+    function test_sellSchedule_shippedMainnetLadderUnchanged() public {
+        assertEq(hook.SELL_DECAY(), 48 hours, "mainnet decay");
+        assertEq(hook.SELL_STEP(), 12 hours, "mainnet step");
+        uint256 t0 = hook.launchTime();
+        _assertSellTaxBps(key, 2000, "step 0: 20%");
+        vm.warp(t0 + 12 hours);
+        _assertSellTaxBps(key, 1600, "step 1: 16%");
+        vm.warp(t0 + 24 hours);
+        _assertSellTaxBps(key, 1200, "step 2: 12%");
+        vm.warp(t0 + 36 hours);
+        _assertSellTaxBps(key, 800, "step 3: 8%");
+        vm.warp(t0 + 48 hours - 1);
+        _assertSellTaxBps(key, 800, "last second of the window is still step 3: 8%");
+        vm.warp(t0 + 48 hours);
+        _assertSellTaxBps(key, 400, "window closed: flat 4%");
+    }
+
+    /// The SHIPPED testnet subclass (20m decay, 5m step; src/testnet/TestnetShortClock.sol) walks the same
+    /// four rates: its max step is also 3, so the compressed ladder is unchanged too.
+    function test_sellSchedule_shippedTestnetLadderUnchanged() public {
+        (QpullTaxHook h, V4PoolKey memory k) =
+            _openPoolWith("src/testnet/TestnetShortClock.sol:QpullTaxHookTestnet", 0x51);
+        assertEq(h.SELL_DECAY(), 20 minutes, "testnet decay");
+        assertEq(h.SELL_STEP(), 5 minutes, "testnet step");
+        uint256 t0 = h.launchTime();
+        _assertSellTaxBps(k, 2000, "step 0: 20%");
+        vm.warp(t0 + 5 minutes);
+        _assertSellTaxBps(k, 1600, "step 1: 16%");
+        vm.warp(t0 + 10 minutes);
+        _assertSellTaxBps(k, 1200, "step 2: 12%");
+        vm.warp(t0 + 15 minutes);
+        _assertSellTaxBps(k, 800, "step 3: 8%");
+        vm.warp(t0 + 20 minutes - 1);
+        _assertSellTaxBps(k, 800, "last second of the window is still step 3: 8%");
+        vm.warp(t0 + 20 minutes);
+        _assertSellTaxBps(k, 400, "window closed: flat 4%");
+    }
+
+    /// SATURATION. A subclass whose decay/step ratio pushes `step` past 3 (60m / 5m -> steps 0..11). With the
+    /// pre-fix formula `SELL_TAX_START_BPS - step * SELL_STEP_BPS` step 5 was a 0% (free) sell and step 6+
+    /// underflow-REVERTED, DoS-ing every sell in the window tail. The schedule now floors at TAX_BPS: the
+    /// shipped part of the ladder is identical, and every later step clears at the flat 4%.
+    function test_sellSchedule_saturatesAtTaxBpsForLargeStep() public {
+        (QpullTaxHook h, V4PoolKey memory k) =
+            _openPoolWith("test/QpullTaxHook.t.sol:LongDecaySellHook", 0x52);
+        uint256 t0 = h.launchTime();
+        _assertSellTaxBps(k, 2000, "step 0: 20%");
+        vm.warp(t0 + 15 minutes);
+        _assertSellTaxBps(k, 800, "step 3: 8% (shipped part of the ladder unchanged)");
+        vm.warp(t0 + 20 minutes); // step 4: 2000 - 1600 = 400 exactly; subtraction and floor agree
+        _assertSellTaxBps(k, 400, "step 4: floors at 4%");
+        vm.warp(t0 + 25 minutes); // step 5: the old formula gave 0%
+        _assertSellTaxBps(k, 400, "step 5: still 4%, never a free sell");
+        vm.warp(t0 + 30 minutes); // step 6: the old formula underflow-reverted
+        _assertSellTaxBps(k, 400, "step 6: sells still clear at 4%");
+        vm.warp(t0 + 60 minutes - 1); // step 11: last second of the window
+        _assertSellTaxBps(k, 400, "step 11: sells still clear at 4%");
+        vm.warp(t0 + 60 minutes);
+        _assertSellTaxBps(k, 400, "window closed: flat 4%");
+    }
+
+    /// Constructor invariant. A subclass with SELL_STEP() == 0 would divide by zero on every launch-window
+    /// sell, a DoS the saturating schedule cannot absorb, so the constructor refuses it with the TYPED error.
+    /// (The virtual getter is dispatched to the subclass even from the base constructor, which is what makes
+    /// the check meaningful.)
+    function test_sellSchedule_zeroStepRefusedAtDeploy() public {
+        address hAddr = address(uint160((0x53 << 16) | FLAGS));
+        // deployCodeTo hides the constructor's revert data behind its own require, so run the init code by
+        // hand exactly the way it does: etch creationCode ++ args at the flag-carrying address and call it.
+        vm.etch(
+            hAddr,
+            abi.encodePacked(
+                vm.getCode("test/QpullTaxHook.t.sol:ZeroStepSellHook"),
+                abi.encode(_cfg(address(packRec), address(boardRec), address(adapter)))
+            )
+        );
+        (bool ok, bytes memory ret) = hAddr.call("");
+        assertFalse(ok, "a zero SELL_STEP must not deploy");
+        assertEq(ret, abi.encodeWithSelector(QpullTaxHook.BadSellSchedule.selector), "typed BadSellSchedule");
     }
 
     // ─── helpers ─────────────────────────────────────────────────────────────
+
+    /// Deploys the hook artifact `what` (base or a subclass) at a fresh flag-carrying address, opens its
+    /// canonical pool as the initializer (stamping launchTime = now) and seeds full-range LP.
+    function _openPoolWith(string memory what, uint8 tag)
+        internal
+        returns (QpullTaxHook h, V4PoolKey memory k)
+    {
+        address hAddr = address((uint160(tag) << 16) | FLAGS);
+        deployCodeTo(what, abi.encode(_cfg(address(packRec), address(boardRec), address(adapter))), hAddr);
+        h = QpullTaxHook(hAddr);
+        k = key;
+        k.hooks = IV4Hooks(hAddr);
+        manager.initialize(k, SQRT_1_1); // sender = this = the initializer
+        vm.prank(address(this), address(this)); // audit F6: tx.origin == initializer for the LP seed
+        liqRouter.modifyLiquidity(k, IV4PoolManager.ModifyLiquidityParams(FULL_LO, FULL_HI, 1e24, 0), "");
+    }
+
+    /// Exact-in sell of 1e21 QPULL by alice through pool `k`; asserts the WETH fee equals `expectedBps` of
+    /// the pool's pre-fee WETH output TO THE WEI. fee = floor(U * bps / 10000) and userOut = U - fee, so
+    /// userOut + fee reconstructs U exactly and the comparison has no rounding slack.
+    function _assertSellTaxBps(V4PoolKey memory k, uint256 expectedBps, string memory why) internal {
+        uint256 sinkBefore = weth.balanceOf(feeSink);
+        uint256 userBefore = weth.balanceOf(alice);
+        bool zeroForOne = !_buyZeroForOne(); // sell = QPULL flows in
+        vm.prank(alice, alice);
+        swapRouter.swap(
+            k,
+            IV4PoolManager.SwapParams(zeroForOne, -1e21, zeroForOne ? MIN_PRICE_P1 : MAX_PRICE_M1),
+            PoolSwapTest.TestSettings(false, false),
+            ""
+        );
+        uint256 fee = weth.balanceOf(feeSink) - sinkBefore;
+        uint256 preFeeOut = (weth.balanceOf(alice) - userBefore) + fee;
+        assertGt(fee, 0, "sell taxed");
+        assertEq(fee, (preFeeOut * expectedBps) / 10_000, why);
+    }
 
     function _ourKey() internal view returns (PoolKey memory k) {
         k = PoolKey({
@@ -490,5 +680,37 @@ contract QpullTaxHookTest is Test {
         assembly {
             a := signextend(15, d)
         }
+    }
+}
+
+/// @dev Deliberately MIS-SET sell schedule (60m decay, 5m step -> steps 0..11). With the pre-fix formula
+///      `SELL_TAX_START_BPS - step * SELL_STEP_BPS` this reached 0% at step 5 and underflow-reverted from
+///      step 6 on. Exists only to prove the schedule saturates at TAX_BPS. NOT a deployable configuration.
+contract LongDecaySellHook is QpullTaxHook {
+    constructor(QpullTaxHook.HookConfig memory c) QpullTaxHook(c) { }
+
+    function SELL_STEP() public pure override returns (uint256) {
+        return 5 minutes;
+    }
+
+    function SELL_DECAY() public pure override returns (uint256) {
+        return 60 minutes;
+    }
+}
+
+/// @dev A zero step length: `(now - launchTime) / SELL_STEP()` would panic (division by zero) on every sell
+///      inside the window. The constructor invariant must refuse it at deploy.
+///      The zero is read from a never-written storage slot rather than written as a literal on purpose: a
+///      constant 0 makes the base constructor's BadSellSchedule revert unconditional, and solc (via_ir) then
+///      refuses to compile such a subclass at all, since its immutables would be "read from but never
+///      assigned" (error 1284). That is an even stronger form of the guard (a literal-zero subclass cannot
+///      even be built), but a storage read keeps this one compilable so the runtime revert is testable.
+contract ZeroStepSellHook is QpullTaxHook {
+    uint256 internal stepLen; // never written: stays 0
+
+    constructor(QpullTaxHook.HookConfig memory c) QpullTaxHook(c) { }
+
+    function SELL_STEP() public view override returns (uint256) {
+        return stepLen;
     }
 }

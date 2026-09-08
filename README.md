@@ -17,7 +17,7 @@ No admin can drain a prize vault; winners pull their own claims.
 1. **The tax hook — `hooks/QpullTaxHook.sol` (highest priority).** The 4% tax is a **V4 hook**,
    not a token transfer tax (a transfer tax breaks V4 flash accounting — that was the finding
    this rework fixes). It is **immutable** (no owner/setters), takes the fee inside the locked
-   context via `take()`, gates the first hour to NFT holders, and fans out game entries to the
+   context via `take()`, gates the first two hours to NFT holders, and fans out game entries to the
    registries. Scrutinize the `afterSwap` delta sign/currency across all four swap shapes, that
    `take(fee)` + the returned `+fee` delta net to a settled unlock, the `exemptSender` conversion
    path, and pool-creation control in `afterInitialize`. Verified against the vendored real
@@ -88,3 +88,11 @@ included. Happy to share those directly with a reviewer.
 
 MIT — see [LICENSE](LICENSE). (Each source file also carries an `SPDX-License-Identifier: MIT`.)
 Vendored `lib/v4-core` is Uniswap Labs' code under its own license (see `lib/v4-core/licenses/`).
+
+## Audit snapshot 2026-09-07
+
+This snapshot mirrors tag `audit-snapshot-2026-09-07` (commit `ecb5528`) of the canonical repo. Pre-launch, unaudited, not deployed to mainnet: audit this source, not a live address. Solidity 0.8.26, Foundry, `via_ir`.
+
+Read first: `SECURITY.md` section 16 (accepted residuals, including no pause by design), `LAUNCH-CHECKLIST.md` section 6b (the ordered mainnet go-live with on-chain post-conditions), and `docs/PREAUDIT-REPORT.md` (the internal multi-agent pre-audit: 23 findings, every one closed or explicitly accepted). `script/GoLiveMainnet.s.sol` is the launch artifact: it seeds 100% of supply through `QpullLiquidityLock` and runs `Treasury.lockRouting()` last.
+
+Test suite at the tag: 36 suites, 393 passed. One test file is intentionally omitted here: `test/PassArtRenderer.t.sol` loads the on-chain pass art fixtures, which are unreleased until the reveal. The renderer contract itself (`src/nft/PassArtRenderer.sol`) is in scope.

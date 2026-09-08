@@ -27,7 +27,11 @@ contract RaffleEngine is NonRenounceableOwnable2Step, ReentrancyGuard {
     IClaimManager public immutable claimManager;
     uint256 public immutable genesis;
 
-    uint256 internal constant DAY = 1 days;
+    // Daily-draw cadence. `virtual` so the TESTNET-ONLY subclass shortens it; MAINNET uses the real 1 day
+    // automatically (no "revert before mainnet" hand-edit — that footgun is gone). Mirrors the jackpot/
+    // holder/leaderboard cadence getters. MUST equal PackRegistry.DAY() (both default 1 day) — enforced at
+    // construction against PackRegistry.dayLength() (pre-audit cadence cross-check, mirrors the genesis one).
+    function DAY() internal view virtual returns (uint256) { return 1 days; }
     uint256 public constant CLAIM_WINDOW = 30 days;
     // Settling beacon reveals REVEAL_LAG after the day closes, so it is unknowable while any in-day ticket
     // is still buyable — otherwise a last-second buyer could grind entries against a now-public beacon
@@ -45,6 +49,11 @@ contract RaffleEngine is NonRenounceableOwnable2Step, ReentrancyGuard {
     uint256 public constant MAX_K = 200; // audit M-3: one-block-safe (was 1000; ~120-140k gas/winner)
     uint256 internal constant BPS = 10_000;
     uint256 internal constant MAX_ADJ_BPS = 2500; // audit M4 (job-745): potCap re-peg bounded to +/-25%/cooldown
+    // ── launch accumulation window (spec §16.x): NO draws for the first 48h — packs + pool build, then the
+    // one-time opening draw runs, then normal daily draws. ACCUM_DAYS * DAY = 48h on mainnet (DAY=1d) and
+    // 10 min on the short-day testnet (DAY=5m), so it scales automatically with DAY. ──
+    uint256 internal constant ACCUM_DAYS = 2; // accumulation window length, in days
+    uint256 public constant OPENING_WINNERS = 5; // the opening draw splits the built-up pool 5 ways
 
     uint256 public winnersPerDay; // K
     // Owner-set MINIMUM pot below which a draw voids WITHOUT consuming the day or burning tickets — closes
@@ -60,10 +69,15 @@ contract RaffleEngine is NonRenounceableOwnable2Step, ReentrancyGuard {
     uint256 public potCap;
     uint64 public lastPotAdjust; // audit M4 (job-745): timestamp of the last setPotCap (cooldown anchor)
     uint64 public lastMinPotAdjust; // audit L-10 (pass-7): cooldown anchor for setMinPot
+    uint64 public lastWinnersAdjust; // audit H-4 (pass-8): cooldown anchor for setWinnersPerDay
     mapping(uint32 => bool) public drawn;
+    bool public openingDone; // set by runOpeningDraw(); daily runDraw() unlocks only after it
 
     event WinnersPerDaySet(uint256 k);
     event DrawExecuted(uint32 indexed day, uint256 pot, uint256 winners);
+    /// @notice One per winning pack. Lets the website's draw log show the ticket, its tier, and the prize
+    ///         per win (DrawExecuted only carries the count). day 0 = the one-time opening sweep.
+    event WinnerPaid(uint32 indexed day, uint256 indexed packId, address owner, uint8 tier, uint256 prize, uint256 claimId);
     event MinPotSet(uint256 minPot);
     event PotCapSet(uint256 potCap);
 
@@ -72,10 +86,14 @@ contract RaffleEngine is NonRenounceableOwnable2Step, ReentrancyGuard {
     error OutsideWindow();
     error BadK();
     error GenesisMismatch();
+    error CadenceMismatch(); // pre-audit: PackRegistry.dayLength() != this DAY() (mis-paired mainnet/testnet deploy)
     error BadPotCap();
     error BadMinPot(); // audit F5
     error AdjustTooSoon(); // audit M4 (job-745)
     error AdjustOutOfBounds(); // audit M4 (job-745)
+    error OpeningPending(); // runDraw() called before the opening draw
+    error OpeningAlreadyDone();
+    error Accumulating(); // opening called before the 48h window closed
 
     constructor(
         address drand_,
@@ -99,6 +117,11 @@ contract RaffleEngine is NonRenounceableOwnable2Step, ReentrancyGuard {
         vault = IVault(vault_);
         claimManager = IClaimManager(claim_);
         if (PackRegistry(packs_).genesis() != genesis_) revert GenesisMismatch(); // audit H-8
+        // pre-audit (cadence cross-check): drawRound/currentDay here and _today/revealRound in the registry all
+        // assume ONE day length. Only genesis was cross-checked before, so a mainnet engine wired to a short-
+        // clock registry (or vice versa) deployed fine and silently desynced every reveal-before-cutoff window.
+        // DAY() dispatches to the most-derived override, so the testnet pair (5m/5m) passes exactly like 1d/1d.
+        if (PackRegistry(packs_).dayLength() != DAY()) revert CadenceMismatch();
         genesis = genesis_;
         if (k_ == 0 || k_ > MAX_K) revert BadK();
         winnersPerDay = k_;
@@ -108,6 +131,16 @@ contract RaffleEngine is NonRenounceableOwnable2Step, ReentrancyGuard {
 
     function setWinnersPerDay(uint256 k) external onlyOwner {
         if (k == 0 || k > MAX_K) revert BadK();
+        // audit H-4 (pass-8): cooldown + the same +/-25% band as setPotCap. drawFrom's selection for K is a
+        // strict prefix of K+1, so before this an owner could atomically re-pick K after a beacon revealed to
+        // re-target who wins. Now K moves at most ~25%/draw-day (a day-open snapshot would be stronger, but
+        // this matches the sibling knobs). audit M-7: band never collapses to a point.
+        if (block.timestamp < uint256(lastWinnersAdjust) + DAY()) revert AdjustTooSoon();
+        uint256 lo = (winnersPerDay * (BPS - MAX_ADJ_BPS)) / BPS;
+        uint256 hi = (winnersPerDay * (BPS + MAX_ADJ_BPS)) / BPS;
+        if (hi <= winnersPerDay) hi = winnersPerDay + 1;
+        if (k < lo || k > hi) revert AdjustOutOfBounds();
+        lastWinnersAdjust = uint64(block.timestamp);
         winnersPerDay = k;
         emit WinnersPerDaySet(k);
     }
@@ -116,9 +149,14 @@ contract RaffleEngine is NonRenounceableOwnable2Step, ReentrancyGuard {
     ///         Cross-checked against potCap (audit L-3): minPot > potCap would silently void every draw.
     function setMinPot(uint256 m) external onlyOwner {
         if (m == 0 || m > potCap) revert BadMinPot(); // audit F5: never 0, never above potCap
-        // audit L-10 (pass-7): rate-limited like setPotCap so an owner can't reactively slam minPot above a
-        // known winner's pot to force the void branch. Primary control remains the timelock+multisig migration.
-        if (block.timestamp < uint256(lastMinPotAdjust) + DAY) revert AdjustTooSoon();
+        // audit L-10 (pass-7): cooldown. audit H-3 (pass-8): add setPotCap's +/-25% band so the owner can't
+        // reactively jump minPot up to potCap after a beacon reveals to force every draw into the void branch.
+        // audit M-7 (pass-8): floor hi at minPot+1 so the band never collapses to a point (minPot <= 3).
+        if (block.timestamp < uint256(lastMinPotAdjust) + DAY()) revert AdjustTooSoon();
+        uint256 lo = (minPot * (BPS - MAX_ADJ_BPS)) / BPS;
+        uint256 hi = (minPot * (BPS + MAX_ADJ_BPS)) / BPS;
+        if (hi <= minPot) hi = minPot + 1;
+        if (m < lo || m > hi) revert AdjustOutOfBounds();
         lastMinPotAdjust = uint64(block.timestamp);
         minPot = m;
         emit MinPotSet(m);
@@ -130,9 +168,10 @@ contract RaffleEngine is NonRenounceableOwnable2Step, ReentrancyGuard {
     ///         minPot to shrink a known winner's prize. Larger moves take several days.
     function setPotCap(uint256 c) external onlyOwner {
         if (c == 0 || c < minPot) revert BadPotCap(); // audit L-3: never below the minPot floor (checked first)
-        if (block.timestamp < uint256(lastPotAdjust) + DAY) revert AdjustTooSoon();
+        if (block.timestamp < uint256(lastPotAdjust) + DAY()) revert AdjustTooSoon();
         uint256 lo = (potCap * (BPS - MAX_ADJ_BPS)) / BPS;
         uint256 hi = (potCap * (BPS + MAX_ADJ_BPS)) / BPS;
+        if (hi <= potCap) hi = potCap + 1; // audit M-7 (pass-8): band never collapses to a point
         if (c < lo || c > hi) revert AdjustOutOfBounds();
         lastPotAdjust = uint64(block.timestamp);
         potCap = c;
@@ -142,12 +181,12 @@ contract RaffleEngine is NonRenounceableOwnable2Step, ReentrancyGuard {
     /// @notice The drand round whose beacon settles day `day` — publishes REVEAL_LAG after day+1 opens,
     ///         so it is unknowable while any in-window ticket is still being bought.
     function drawRound(uint32 day) public view returns (uint64) {
-        return drand.roundAt(genesis + (uint256(day) + 1) * DAY + REVEAL_LAG);
+        return drand.roundAt(genesis + (uint256(day) + 1) * DAY() + REVEAL_LAG);
     }
 
     function currentDay() public view returns (uint32) {
         if (block.timestamp <= genesis) return 0;
-        return uint32((block.timestamp - genesis) / DAY);
+        return uint32((block.timestamp - genesis) / DAY());
     }
 
     /// @notice Tier bucket share in bps. 0=Common,1=Uncommon,2=Rare,3=SuperRare.
@@ -158,9 +197,69 @@ contract RaffleEngine is NonRenounceableOwnable2Step, ReentrancyGuard {
         return 1000; // Common 10%
     }
 
+    /// @notice The one-time OPENING draw. After the 48h accumulation window (ACCUM_DAYS), split the built-up
+    ///         pool among OPENING_WINNERS winners drawn from ALL packs bought during the window — the rolling
+    ///         draw window for drawDay ACCUM_DAYS already spans cohorts [0, ACCUM_DAYS-1], so no cohort voids.
+    ///         Daily draws (runDraw) unlock only after this runs. Same pot/tier logic as a normal draw.
+    ///         VOID-ON-MISS (pre-audit L, opening-draw liveness): if the pot is below `minPot` (or too small to
+    ///         pay every opening winner at least 1 wei) when this is called at/after the window close, the
+    ///         opening is FORGONE, not deferred. It still settles (openingDone = true) so the daily draws
+    ///         unlock, but pays nobody and burns no tickets; the whole pot rolls forward into the daily draws,
+    ///         which cover the same cohorts and self-void under minPot until the vault is funded. Deferring
+    ///         used to leave openingDone=false, and since runDraw is gated on it, EVERY daily draw stayed
+    ///         blocked until the vault cleared minPot. Runbook: fund the vault above minPot before the
+    ///         accumulation window closes so the opening actually pays.
+    /// @dev    NOTE (finding-2 review): cohorts [0, ACCUM_DAYS-1] are NOT consumed whole here — the opening
+    ///         pops only OPENING_WINNERS packs, and those cohorts stay eligible for the normal 7-day window
+    ///         (including a later runDraw(ACCUM_DAYS)). A forgone opening pops nothing at all, so those cohorts
+    ///         keep every ticket for that window. `potCap` bounds EACH draw independently; it is a
+    ///         per-draw cap plus rollover, not a per-cohort-lifetime cap. No pack or wei is ever paid twice:
+    ///         popped packs are marked spent, and each draw reserves its own snapshotted pot.
+    function runOpeningDraw() external nonReentrant {
+        if (openingDone) revert OpeningAlreadyDone();
+        if (currentDay() < ACCUM_DAYS) revert Accumulating(); // pool still building — no draw during the window
+
+        uint256 pot = vault.freeBalance();
+        if (pot > potCap) pot = potCap; // audit H-3: bound the payout; excess rolls forward
+        if (pot < minPot || (pot * bucketBps(0)) / BPS < OPENING_WINNERS) {
+            // pre-audit L (opening-draw liveness): too small to pay every opening winner >= 1 wei. This used to
+            // return WITHOUT settling ("retry when funded"), but runDraw is gated on openingDone, so an under-
+            // minPot vault at window close blocked every daily draw until someone funded it and re-called this.
+            // Now the opening is FORGONE (void-on-miss): settle it so the daily draws unlock, pay nobody, burn
+            // no tickets (no sweep, so cohorts [0, ACCUM_DAYS-1] keep every ticket for the daily rolling window
+            // that already spans them), read no beacon (a forgone opening must not depend on drand being on
+            // time), and let the pot roll forward: the daily draws self-void under minPot until funded.
+            // This branch is reachable only once currentDay() >= ACCUM_DAYS (the Accumulating guard above) AND
+            // the pot is unpayable at this instant, so a payable opening can never be skipped through it: any
+            // pot >= minPot (and >= OPENING_WINNERS wei in the Common bucket) takes the paid path below, unchanged.
+            openingDone = true;
+            emit DrawExecuted(0, pot, 0);
+            return;
+        }
+        // beacon settles right after the window closes: round at genesis + ACCUM_DAYS*DAY + REVEAL_LAG
+        bytes32 beacon = drand.randomness(drawRound(uint32(ACCUM_DAYS - 1)));
+        // PAID-ONLY (finding-2): the opening beacon is already public relative to a day-ACCUM_DAYS free freeze,
+        // so the free block must be structurally excluded here regardless of when this permissionless call lands.
+        uint256[] memory winners = packs.drawFromPaidOnly(beacon, uint32(ACCUM_DAYS), OPENING_WINNERS); // sweeps [0, ACCUM_DAYS-1]
+        // audit (opening-brick fix): mark the opening settled the moment the sweep runs, REGARDLESS of whether
+        // the accumulation window held any tickets. The window [0, ACCUM_DAYS-1] can never be back-filled once
+        // it has passed, so an empty window that returned early here used to leave openingDone=false forever —
+        // permanently bricking every daily draw when nobody bought in the first ACCUM_DAYS. The pot-too-small
+        // guard above settles as well now (pre-audit L), so once the window has closed EVERY exit from this
+        // function leaves openingDone=true and the daily draws unlocked.
+        openingDone = true;
+        if (winners.length == 0) {
+            emit DrawExecuted(0, pot, 0);
+            return; // opening settled with no early tickets — daily draws now sweep later cohorts
+        }
+        _payWinners(0, pot, winners); // day 0 = the one-time opening sweep
+        emit DrawExecuted(0, pot, winners.length);
+    }
+
     function runDraw(uint32 day) external nonReentrant {
+        if (!openingDone) revert OpeningPending(); // daily draws start only after the opening sweep
         if (drawn[day]) revert AlreadyDrawn();
-        if (day == 0) revert BadDay();
+        if (day < ACCUM_DAYS) revert BadDay(); // the window's days were settled by the opening draw
         if (currentDay() != day + 1) revert OutsideWindow(); // the day after only — else void
 
         // Snapshot the pot BEFORE touching tickets. If nothing is payable, do NOT run the draw: drawFrom
@@ -170,28 +269,28 @@ contract RaffleEngine is NonRenounceableOwnable2Step, ReentrancyGuard {
         uint256 pot = vault.freeBalance();
         if (pot > potCap) pot = potCap; // audit H-3: bound the single-day payout; excess rolls forward
         // Skip (WITHOUT burning tickets or marking the day drawn) when the pot is too small to pay even a full
-        // field of winners in the SMALLEST tier bucket. This guarantees every drawn winner receives >=1 wei,
-        // so no ticket is ever spent for a zero payout (audit H-17; subsumes the old pot==0 guard). The
-        // smallest bucket is Common = pot*bucketBps(0)/BPS = pot/10; dividing it among up to winnersPerDay
-        // winners is >=1 exactly when smallestBucket >= winnersPerDay.
+        // field of winners in the SMALLEST tier bucket. Guarantees every drawn winner receives >=1 wei (audit H-17).
         if (pot < minPot || (pot * bucketBps(0)) / BPS < winnersPerDay) {
             emit DrawExecuted(day, pot, 0);
             return; // retry when funded (audit C-1: sub-minPot dust never consumes the day or burns tickets)
         }
 
         bytes32 beacon = drand.randomness(drawRound(day)); // reverts if beacon missing (retry within window)
-
         uint256[] memory winners = packs.drawFrom(beacon, day, winnersPerDay);
-        uint256 n = winners.length;
-        if (n == 0) {
-            // audit F16: an empty ticket window pops nothing — do NOT consume the day (matches the sibling
-            // engines' zero-outcome branches), so a later retry within the window can still draw.
+        if (winners.length == 0) {
+            // audit F16: an empty ticket window pops nothing — do NOT consume the day, so a later retry can draw.
             emit DrawExecuted(day, pot, 0);
             return;
         }
         drawn[day] = true;
+        _payWinners(day, pot, winners);
+        emit DrawExecuted(day, pot, winners.length);
+    }
 
-        // Pass 1: resolve tiers and count winners per tier.
+    /// @dev Resolve each winner's tier, then write a claim for its equal share of its tier bucket. Single
+    ///      combined division (audit L-14) — (pot·bps)/(BPS·count). Unpaid buckets stay in the vault.
+    function _payWinners(uint32 day, uint256 pot, uint256[] memory winners) internal {
+        uint256 n = winners.length;
         uint8[] memory tiers = new uint8[](n);
         uint256[4] memory counts;
         for (uint256 i; i < n; ++i) {
@@ -201,17 +300,14 @@ contract RaffleEngine is NonRenounceableOwnable2Step, ReentrancyGuard {
                 counts[t] += 1;
             }
         }
-
-        // Pass 2: write a claim to each winner for its equal share of its tier bucket. Single combined
-        // division (audit L-14) — (pot·bps)/(BPS·count) — avoids the extra floor of a two-step divide.
-        // Unpaid buckets (tiers with no winner) simply stay in the vault → next snapshot.
         uint64 deadline = uint64(block.timestamp + CLAIM_WINDOW);
         for (uint256 i; i < n; ++i) {
             uint8 t = tiers[i];
             uint256 prize = (pot * bucketBps(t)) / (BPS * counts[t]);
             if (prize == 0) continue;
-            claimManager.registerClaim(address(vault), packs.ownerOf(winners[i]), prize, deadline);
+            address owner = packs.ownerOf(winners[i]);
+            uint256 claimId = claimManager.registerClaim(address(vault), owner, prize, deadline);
+            emit WinnerPaid(day, winners[i], owner, t, prize, claimId); // per-win record for the draw log
         }
-        emit DrawExecuted(day, pot, n);
     }
 }

@@ -24,8 +24,11 @@ contract LeaderboardEngine is NonRenounceableOwnable2Step, ReentrancyGuard {
     IVault public immutable vault;
     IClaimManager public immutable claimManager;
     uint256 public immutable genesis;
+    uint256 public immutable weekAnchor; // Sunday 00:00 UTC anchor, derived from genesis (matches registry)
 
-    uint256 internal constant WEEK = 7 days;
+    // `virtual` so a TESTNET-ONLY subclass can shorten the week; mainnet + tests keep 7 days (Sunday-aligned).
+    // MUST equal LeaderboardRegistry.WEEK() — enforced at construction (pre-audit cadence cross-check).
+    function WEEK() public view virtual returns (uint256) { return 7 days; }
     uint256 public constant CLAIM_WINDOW = 30 days;
     uint256 internal constant BPS = 10_000;
     uint256 internal constant MAX_ADJ_BPS = 2500; // audit M4 (job-745): potCap re-peg bounded to +/-25%/week
@@ -48,6 +51,7 @@ contract LeaderboardEngine is NonRenounceableOwnable2Step, ReentrancyGuard {
     error BadPotCap();
     error BadMinPot(); // audit F5
     error GenesisMismatch();
+    error CadenceMismatch(); // pre-audit: registry WEEK()/weekAnchor differ from this engine's (mis-paired deploy)
     error AdjustTooSoon(); // audit M4 (job-745)
     error AdjustOutOfBounds(); // audit M4 (job-745)
 
@@ -71,7 +75,20 @@ contract LeaderboardEngine is NonRenounceableOwnable2Step, ReentrancyGuard {
         // audit L-2: cross-check the registry's genesis (mirrors RaffleEngine/JackpotEngine's H-8 check) —
         // a divergence would desync the distribute() window from the registry's accrual-week numbering.
         if (LeaderboardRegistry(registry_).genesis() != genesis_) revert GenesisMismatch();
+        // pre-audit (cadence cross-check): genesis alone does not pin the week numbering — WEEK() and the anchor
+        // derivation are both `virtual`, so a mainnet engine on a short-clock registry (or a subclass that
+        // overrides only one half of the pair) would deploy fine and desync accrual weeks from distribute
+        // windows. Assert both halves live, exactly as genesis is asserted. WEEK() dispatches to the most-
+        // derived override, so the testnet pair (10m/10m, genesis-anchored) passes exactly like 7d/7d.
+        if (LeaderboardRegistry(registry_).WEEK() != WEEK()) revert CadenceMismatch();
         genesis = genesis_;
+        // Same Sunday derivation as the registry — identical genesis (checked above) => identical weekAnchor,
+        // so currentWeek() here and in the registry stay byte-for-byte in sync (audit note: (b) desync risk).
+        // Derivation is `virtual` so the TESTNET-ONLY subclass can anchor to genesis with a short week; the
+        // registry subclass overrides it identically, preserving that byte-for-byte sync — now a checked fact.
+        uint256 wa = _deriveWeekAnchor(genesis_);
+        if (LeaderboardRegistry(registry_).weekAnchor() != wa) revert CadenceMismatch();
+        weekAnchor = wa;
         minPot = minPot_;
         potCap = potCap_;
     }
@@ -81,9 +98,10 @@ contract LeaderboardEngine is NonRenounceableOwnable2Step, ReentrancyGuard {
     ///         front-run a determined weekly distribute to shrink a known winner's payout.
     function setPotCap(uint256 c) external onlyOwner {
         if (c == 0 || c < minPot) revert BadPotCap();
-        if (block.timestamp < uint256(lastPotAdjust) + WEEK) revert AdjustTooSoon();
+        if (block.timestamp < uint256(lastPotAdjust) + WEEK()) revert AdjustTooSoon();
         uint256 lo = (potCap * (BPS - MAX_ADJ_BPS)) / BPS;
         uint256 hi = (potCap * (BPS + MAX_ADJ_BPS)) / BPS;
+        if (hi <= potCap) hi = potCap + 1; // audit M-7 (pass-8): band never collapses to a point
         if (c < lo || c > hi) revert AdjustOutOfBounds();
         lastPotAdjust = uint64(block.timestamp);
         potCap = c;
@@ -94,15 +112,27 @@ contract LeaderboardEngine is NonRenounceableOwnable2Step, ReentrancyGuard {
     ///         Cross-checked against potCap (audit L-3): minPot > potCap would silently void every week.
     function setMinPot(uint256 m) external onlyOwner {
         if (m == 0 || m > potCap) revert BadMinPot(); // audit F5: never 0, never above potCap
-        if (block.timestamp < uint256(lastMinPotAdjust) + WEEK) revert AdjustTooSoon(); // audit L-10 (pass-7)
+        // audit L-10 (pass-7): cooldown. audit H-3 (pass-8): +/-25% band (as setPotCap). audit M-7: band never
+        // collapses to a point. Stops a reactive minPot->potCap jump after the week's (public) outcome is known.
+        if (block.timestamp < uint256(lastMinPotAdjust) + WEEK()) revert AdjustTooSoon();
+        uint256 lo = (minPot * (BPS - MAX_ADJ_BPS)) / BPS;
+        uint256 hi = (minPot * (BPS + MAX_ADJ_BPS)) / BPS;
+        if (hi <= minPot) hi = minPot + 1;
+        if (m < lo || m > hi) revert AdjustOutOfBounds();
         lastMinPotAdjust = uint64(block.timestamp);
         minPot = m;
         emit MinPotSet(m);
     }
 
+    /// @notice Most-recent Sunday 00:00 UTC at/before genesis (payouts land on Sundays). `virtual` so the
+    ///         TESTNET-ONLY subclass can anchor to genesis with a short week; MUST mirror the registry's.
+    function _deriveWeekAnchor(uint256 genesis_) internal view virtual returns (uint256) {
+        return genesis_ >= 3 days ? genesis_ - ((genesis_ - 3 days) % 7 days) : 0;
+    }
+
     function currentWeek() public view returns (uint256) {
-        if (block.timestamp <= genesis) return 0;
-        return (block.timestamp - genesis) / WEEK;
+        if (block.timestamp < weekAnchor) return 0;
+        return (block.timestamp - weekAnchor) / WEEK(); // Sunday-aligned, matches registry._week()
     }
 
     function distribute(uint256 week) external nonReentrant {

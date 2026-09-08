@@ -16,6 +16,7 @@ import { PoolModifyLiquidityTest } from "v4-core/test/PoolModifyLiquidityTest.so
 import { QPULLToken } from "../src/QPULLToken.sol";
 import { Treasury } from "../src/Treasury.sol";
 import { NFTCollection } from "../src/NFTCollection.sol";
+import { PassArtRenderer } from "../src/nft/PassArtRenderer.sol";
 import { QpullTaxHook } from "../src/hooks/QpullTaxHook.sol";
 import { QpullWethAdapter } from "../src/adapters/QpullWethAdapter.sol";
 import { MockWETH } from "./mocks/MockWETH.sol";
@@ -24,7 +25,7 @@ import { MockDrandOracle } from "./mocks/MockDrandOracle.sol";
 import { MockRecorder } from "./mocks/MockRecorder.sol";
 
 /// @notice END-TO-END raise → launch → trade, against the REAL PoolManager:
-///           1. the NFT mint RAISES ETH and auto-splits it 80% LP / 15% seed / 5% team;
+///           1. the NFT mint RAISES ETH and auto-splits it 80% LP / 10% seed / 10% team;
 ///           2. finalizeLaunch + withdrawProceeds pull the LP bucket to the launcher;
 ///           3. that raised ETH (wrapped to WETH, paired with QPULL) SEEDS the canonical QPULL/WETH
 ///              V4 pool created WITH the tax hook;
@@ -82,7 +83,7 @@ contract RaiseToLaunchTest is Test {
         oracle = new MockDrandOracle(block.timestamp, 3);
         treasury = new Treasury(address(qpull), address(weth), address(quotron), address(this));
         rec = new MockRecorder();
-        nft = new NFTCollection(MINT_PRICE, address(oracle), 1 hours, address(this));
+        nft = new NFTCollection(MINT_PRICE, address(oracle), 1 hours, address(new PassArtRenderer(address(this))), address(this));
         adapter = new QpullWethAdapter(address(manager), address(qpull), address(weth), address(this));
 
         QpullTaxHook.HookConfig memory hc = QpullTaxHook.HookConfig({
@@ -93,11 +94,12 @@ contract RaiseToLaunchTest is Test {
             tickSpacing: TICK_SPACING,
             treasury: address(treasury),
             packRegistry: address(rec),
-            jackpotRegistry: address(rec),
             leaderboardRegistry: address(rec),
             nft: address(nft),
             exemptSender: address(adapter),
-            initializer: address(this)
+            initializer: address(this),
+            // throttle not under test here: this suite buys 1 ether inside the gate window
+            earlyBuyCapWei: type(uint256).max
         });
         deployCodeTo("src/hooks/QpullTaxHook.sol:QpullTaxHook", abi.encode(hc), hookAddr);
         hook = QpullTaxHook(hookAddr);
@@ -114,13 +116,18 @@ contract RaiseToLaunchTest is Test {
     /// 1-2. Raise ETH via the NFT mint, then pull the frozen buckets. Returns the LP ETH the launcher holds.
     function _raiseViaMint() internal returns (uint256 lpEth) {
         nft.setRecipients(address(this), seedTreasury, team); // THIS = lpTreasury
+        nft.setAllowlistRoot(keccak256("raise")); // any non-zero root; this raise uses the open path
         nft.setMintOpen(true);
+        // pass-11: start the mint (one-shot), then warp past GTD + overflow into the PUBLIC window, where the
+        // open mint() path is live and the per-wallet cap is PUBLIC_CAP.
+        nft.openAllowlistMint();
+        vm.warp(nft.publicOpensAt());
 
         vm.deal(alice, MINT_PRICE);
         vm.prank(alice);
         nft.mint{ value: MINT_PRICE }(); // alice becomes a holder
 
-        // pass-7: spread the raise across distinct wallets (NFTCollection caps mints at MAX_PER_WALLET = 5)
+        // pass-11: spread the raise across distinct wallets (NFTCollection caps mints at PUBLIC_CAP = 20)
         for (uint256 i; i < N - 1; ++i) {
             address m = address(uint160(uint256(uint160(minter)) + i + 1));
             vm.deal(m, MINT_PRICE);
@@ -138,8 +145,8 @@ contract RaiseToLaunchTest is Test {
 
         lpEth = address(this).balance - lpBefore;
         assertEq(lpEth, (N * MINT_PRICE * 8000) / 10_000, "LP bucket = 80% of the raise");
-        assertEq(seedTreasury.balance - seedBefore, (N * MINT_PRICE * 1500) / 10_000, "seed bucket = 15%");
-        assertEq(team.balance - teamBefore, (N * MINT_PRICE * 500) / 10_000, "team bucket = 5%");
+        assertEq(seedTreasury.balance - seedBefore, (N * MINT_PRICE * 1000) / 10_000, "seed bucket = 10%");
+        assertEq(team.balance - teamBefore, (N * MINT_PRICE * 1000) / 10_000, "team bucket = 10%");
     }
 
     /// 3. Create the canonical hooked pool and seed it with the raised ETH (wrapped) + QPULL.

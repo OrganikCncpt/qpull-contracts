@@ -10,10 +10,12 @@ import { IDrandOracle } from "../interfaces/IDrandOracle.sol";
 ///         key is accepted — no relayers, no trust. The sole IDrandOracle implementation the protocol
 ///         deploys (the committee/DERP alternates were removed as unused and non-time-locked).
 ///
-/// @dev    quicknet: sigs on G1 (48-byte compressed → submitted uncompressed, 128 bytes), pubkey on
-///         G2, period 3s. Verify: e(H(m), pk) == e(sig, G2) where m = sha256(round_be8) and H is
-///         RFC-9380 hash-to-G1. Stored randomness = keccak256(sig) — deterministic from the verified
-///         signature and recomputable by anyone from the public drand beacon.
+/// @dev    quicknet: sigs on G1, pubkey on G2, period 3s. Verify: e(H(m), pk) == e(sig, G2) where
+///         m = sha256(round_be8) and H is RFC-9380 hash-to-G1. submitBeacon takes BOTH the 48-byte
+///         COMPRESSED sig drand publishes and its 128-byte uncompressed expansion: the pairing runs on the
+///         128-byte form, the 48-byte form is bound to that verified point and stored, and the stored
+///         randomness = keccak256(compressed). So signatureOf is byte-identical to drand's public archive
+///         and recomputable by anyone from the beacon.
 ///
 ///         The verifier (hash-to-curve + pairing) was validated against a real beacon (round 1000)
 ///         via py_ecc-generated vectors in the test suite. Still: this is specialist crypto — get a
@@ -28,6 +30,9 @@ contract BlsDrandOracle is IDrandOracle {
     // BLS12-381 field modulus p (48 bytes)
     bytes internal constant P =
         hex"1a0111ea397fe69a4b1ba7b6434bacd764774b84f38512bf6730d2a0f6b0f6241eabfffeb153ffffb9feffffffffaaab";
+    // (p-1)/2, 48 bytes. A y-coordinate is the "larger" of the two roots (compressed sign bit set) iff y > this.
+    bytes internal constant HALF_P =
+        hex"0d0088f51cbff34d258dd3db21a5d66bb23ba5c279c2895fb39869507b587b120f55ffff58a9ffffdcff7fffffffd555";
 
     // DST for bls-unchained-g1-rfc9380, with the trailing length byte (RFC 9380 DST_prime)
     bytes internal constant DST_PRIME =
@@ -46,10 +51,17 @@ contract BlsDrandOracle is IDrandOracle {
 
     mapping(uint64 => bytes32) internal _rand;
     mapping(uint64 => bool) internal _ok;
+    /// @notice The verified signature recorded per round, as drand's 48-byte COMPRESSED encoding, so anyone
+    ///         can recompute the seed from on-chain state alone and check it against drand's public archive
+    ///         for that round (public auditability: fetch round R from any drand node, it IS these 48 bytes,
+    ///         keccak them, compare to `randomness(R)`).
+    mapping(uint64 => bytes) public signatureOf;
 
     event BeaconVerified(uint64 indexed round, bytes32 randomness);
 
     error BadSigLength();
+    error BadCompressedForm(); // 48-byte compressed sig has the wrong length or bad flag bits
+    error CompressionMismatch(); // the compressed sig is not the canonical compression of the verified point
     error InvalidBeacon();
     error PrecompileFailed();
     error TimestampBeforeGenesis();
@@ -83,24 +95,85 @@ contract BlsDrandOracle is IDrandOracle {
         if (!okMap || mapOut.length != 128) revert PrecompileUnavailable();
     }
 
-    /// @notice Permissionless: submit round `round`'s uncompressed (128-byte) drand signature. Stores
-    ///         randomness only if the BLS pairing verifies against the drand group key.
-    function submitBeacon(uint64 round, bytes calldata sig) external {
+    /// @notice Permissionless: submit round `round`'s drand signature in BOTH forms - the 48-byte COMPRESSED
+    ///         encoding drand actually publishes (`comp`), and its 128-byte EIP-2537 UNCOMPRESSED expansion
+    ///         (`sig`). The pairing is verified on `sig` exactly as before; `comp` is then bound to that
+    ///         verified point and stored, so `signatureOf[round]` is byte-identical to drand's public archive
+    ///         and the seed is `keccak256(comp)`.
+    ///
+    /// @dev    WHY BOTH FORMS INSTEAD OF DECOMPRESSING ON-CHAIN: this contract is the randomness root. The
+    ///         128-byte pairing path below is unchanged and already reviewed; binding `comp` to it needs only
+    ///         byte comparisons, adding NO new cryptographic operation (no on-chain sqrt / field arithmetic)
+    ///         to the security-critical path. `sig` is untrusted scratch: if it is not drand's real point the
+    ///         pairing rejects it, and if `comp` is not the unique canonical compression of that verified
+    ///         point the binding rejects it, so `comp` that is stored is provably drand's published bytes.
+    ///
+    ///         TWO SOUNDNESS PROPERTIES ARE DELEGATED TO THE EIP-2537 PAIRING PRECOMPILE (0x0f). Stated
+    ///         explicitly so a cryptographic reviewer checks them rather than re-deriving them:
+    ///
+    ///         1. SUBGROUP MEMBERSHIP. Neither `H` nor `sig` is subgroup-checked here. EIP-2537's pairing
+    ///            precompile validates that every input point is in the prime-order subgroup and rejects
+    ///            (reverts) otherwise, so an off-subgroup "signature" can never verify. This is the correct
+    ///            layer for the check - reimplementing it in Solidity would only add surface - but it IS an
+    ///            assumption on the precompile, so it must be confirmed, not assumed (audit F20).
+    ///
+    ///         2. ENCODING CANONICITY => SEED UNIQUENESS. The seed is `keccak256(comp)`, and `_bindCompressed`
+    ///            forces `comp` to be the ONE canonical compression of the pairing-verified point: the
+    ///            compression flag set, the infinity flag clear, the 48-byte x equal to the verified point's x
+    ///            (whose canonicity, x < p, the pairing precompile already enforced), and the sign bit equal to
+    ///            whether the verified y exceeds (p-1)/2. Exactly one 48-byte string satisfies all four, so a
+    ///            given beacon yields exactly one seed. Also confirm under F20.
+    function submitBeacon(uint64 round, bytes calldata sig, bytes calldata comp) external {
         if (sig.length != 128) revert BadSigLength();
         if (_ok[round]) return; // idempotent
 
         bytes32 m = sha256(abi.encodePacked(round)); // round as 8-byte big-endian
         bytes memory h = _hashToG1(m);
 
-        // e(H, PK) * e(sig, -G2) == 1
+        // e(H, PK) * e(sig, -G2) == 1  (unchanged: the proven verification path)
         bytes memory input = bytes.concat(h, PK, sig, NEG_G2);
         (bool success, bytes memory out) = BLS_PAIRING.staticcall(input);
         if (!success || out.length != 32 || out[31] != 0x01) revert InvalidBeacon();
 
-        bytes32 rnd = keccak256(sig);
+        // Bind drand's canonical 48-byte compressed form to the verified point, then store IT (byte-identical
+        // to the drand archive) and seed from it. Reverts unless `comp` is that unique canonical compression.
+        _bindCompressed(comp, sig);
+
+        bytes32 rnd = keccak256(comp);
         _rand[round] = rnd;
         _ok[round] = true;
+        signatureOf[round] = comp;
         emit BeaconVerified(round, rnd);
+    }
+
+    /// @dev Require that `comp` (48-byte compressed G1) is the unique canonical compression of the
+    ///      already-pairing-verified point `sig` (128-byte EIP-2537 uncompressed). No field arithmetic: the
+    ///      point's validity and x-canonicity were established by the pairing precompile; this only checks the
+    ///      three metadata flag bits, that x matches, and that the sign bit matches y vs (p-1)/2.
+    function _bindCompressed(bytes calldata comp, bytes calldata sig) internal pure {
+        if (comp.length != 48) revert BadCompressedForm();
+        uint8 b0 = uint8(comp[0]);
+        if (b0 & 0x80 == 0) revert BadCompressedForm(); // compression flag MUST be set
+        if (b0 & 0x40 != 0) revert BadCompressedForm(); // infinity flag MUST be clear (a real signature)
+        // x from `comp` (top 3 flag bits cleared) must equal x from the verified point: sig[16..64).
+        if (bytes1(b0 & 0x1f) != sig[16]) revert CompressionMismatch();
+        for (uint256 i = 1; i < 48; ++i) {
+            if (comp[i] != sig[16 + i]) revert CompressionMismatch();
+        }
+        // sign bit (bit 5) set iff the verified y = sig[80..128) is the larger root, i.e. y > (p-1)/2.
+        bool signSet = (b0 & 0x20) != 0;
+        if (signSet != _yExceedsHalfP(sig)) revert CompressionMismatch();
+    }
+
+    /// @dev Big-endian compare of the verified y-coordinate (sig[80..128), 48 bytes) against (p-1)/2.
+    function _yExceedsHalfP(bytes calldata sig) internal pure returns (bool) {
+        bytes memory half = HALF_P;
+        for (uint256 i; i < 48; ++i) {
+            uint8 y = uint8(sig[80 + i]);
+            uint8 h = uint8(half[i]);
+            if (y != h) return y > h;
+        }
+        return false; // exactly (p-1)/2 is not "larger"
     }
 
     // ─── RFC 9380 hash-to-G1 (expand_message_xmd + map_to_curve ×2 + add) ─────

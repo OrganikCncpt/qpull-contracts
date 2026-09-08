@@ -109,11 +109,11 @@ contract QpullWethPoolForkTest is Test {
                     tickSpacing: 60,
                     treasury: feeSink,
                     packRegistry: address(rec),
-                    jackpotRegistry: address(rec),
                     leaderboardRegistry: address(rec),
                     nft: address(nft),
                     exemptSender: address(adapter),
-                    initializer: address(this)
+                    initializer: address(this),
+                    earlyBuyCapWei: type(uint256).max // throttle not under test here
                 })
             ),
             hookAddr

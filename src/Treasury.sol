@@ -16,7 +16,7 @@ import { ISwapAdapter } from "./interfaces/ISwapAdapter.sol";
 ///         the three prize vaults (spec §3). Batching keeps Quotron's 3% hook fee (§9) off every
 ///         trade — it is paid once per conversion.
 ///
-/// @dev    Split, in bps of total tax: raffle 6125 / jackpot 625 / leaderboard 1250 / team 2000.
+/// @dev    Split, in bps of total tax: raffle 6125 / holder 625 / leaderboard 1250 / team 2000.
 ///         Swaps route through ISwapAdapter with slippage bounds, keeper-gated (see convert()).
 ///         The QpullWethAdapter is fee-exempt on the hook (exemptSender), so the protocol-side
 ///         QPULL→WETH conversion swap is itself untaxed.
@@ -30,29 +30,33 @@ contract Treasury is NonRenounceableOwnable2Step, ReentrancyGuard, IERC721Receiv
     uint256 internal constant BPS = 10_000;
     uint256 public constant TEAM_BPS = 2000; // 20% of tax
     uint256 public constant HOURLY_BPS = 6125; // 61.25% (daily raffle)
-    uint256 public constant JACKPOT_BPS = 625; // 6.25%
+    uint256 public constant HOLDER_BPS = 625; // 6.25% (weekly holder draw)
     uint256 public constant LEADERBOARD_BPS = 1250; // 12.5% (doubled from 6.25%)
-    uint256 internal constant PRIZE_BPS = HOURLY_BPS + JACKPOT_BPS + LEADERBOARD_BPS; // 8000
+    uint256 internal constant PRIZE_BPS = HOURLY_BPS + HOLDER_BPS + LEADERBOARD_BPS; // 8000
 
     ISwapAdapter public qpullWeth; // QPULL -> WETH
     ISwapAdapter public wethQuotron; // WETH -> QUOTRON
     address public prizeVault;
-    address public jackpotVault;
+    address public holderVault;
     address public leaderboardVault;
     address public team;
 
     uint256 public convertThreshold; // min QPULL balance before convert() proceeds
-    // Max QPULL swapped per convert() call. Default uncapped; the owner sets a pool-sized ceiling at launch so
-    // an untaxed donation that inflates the balance beyond pool depth can't permanently brick convert() — the
-    // keeper just drains the excess over several pool-sized slices (audit H-3). Excess stays as QPULL balance.
-    uint256 public maxConvertPerCall = type(uint256).max;
+    // Max QPULL swapped per convert() call. The owner sets a pool-sized ceiling at go-live so an untaxed
+    // donation that inflates the balance beyond pool depth can't permanently brick convert() — the keeper
+    // just drains the excess over several pool-sized slices (audit H-3). Excess stays as QPULL balance.
+    // pre-audit MEDIUM (treasury-convert): this used to DEFAULT to type(uint256).max (fail-OPEN) and no
+    // deploy/go-live script ever armed it, silently nullifying H-3. It now defaults to 0 = "not configured"
+    // and convert() reverts NotConfigured until BOTH caps are armed (script/GoLiveMainnet.s.sol, step 1).
+    // The setter already rejects 0, so 0 is an unambiguous "never set" sentinel.
+    uint256 public maxConvertPerCall; // 0 = not configured (fail-closed); see convert()
     // Max WETH swapped per convert() call — the mirror of maxConvertPerCall for the SECOND leg (audit H-1).
     // Since the V4 hook now delivers sell-tax as WETH straight to this Treasury, WETH is a donation-inflatable
     // balance too: without a cap, one large WETH donation would force the whole balance through the shallow
     // QUOTRON pool in a single swap, and a revert there (oversized input) reverts the entire nonReentrant
-    // convert() — stranding the QPULL leg too, since convert() is the ONLY path that moves WETH out. Default
-    // uncapped; owner sets a pool-sized ceiling at launch and the keeper drains the excess over several calls.
-    uint256 public maxWethConvertPerCall = type(uint256).max;
+    // convert() — stranding the QPULL leg too, since convert() is the ONLY path that moves WETH out. Same
+    // fail-closed default as maxConvertPerCall: 0 until the owner arms a pool-sized ceiling at go-live.
+    uint256 public maxWethConvertPerCall; // 0 = not configured (fail-closed); see convert()
     mapping(address => bool) public isKeeper; // only an authorized keeper may trigger convert()
     mapping(address => uint256) public quotronOwed; // M-2 (pass-7): QUOTRON stuck on a failed vault send, retried to THAT vault
 
@@ -64,7 +68,7 @@ contract Treasury is NonRenounceableOwnable2Step, ReentrancyGuard, IERC721Receiv
     bool public routingLocked;
 
     event AdaptersSet(address qpullWeth, address wethQuotron);
-    event RoutingSet(address prizeVault, address jackpotVault, address leaderboardVault, address team);
+    event RoutingSet(address prizeVault, address holderVault, address leaderboardVault, address team);
     event RoutingLocked();
     event ConvertThresholdSet(uint256 convertThreshold);
     event MaxConvertPerCallSet(uint256 maxConvertPerCall);
@@ -107,22 +111,22 @@ contract Treasury is NonRenounceableOwnable2Step, ReentrancyGuard, IERC721Receiv
         emit AdaptersSet(qpullWeth_, wethQuotron_);
     }
 
-    function setRouting(address prize_, address jackpot_, address leaderboard_, address team_)
+    function setRouting(address prize_, address holder_, address leaderboard_, address team_)
         external
         onlyOwner
     {
         if (routingLocked) revert RoutingAlreadyLocked(); // audit F2 (pass-5): destinations are final
         if (
-            prize_ == address(0) || jackpot_ == address(0) || leaderboard_ == address(0)
+            prize_ == address(0) || holder_ == address(0) || leaderboard_ == address(0)
                 || team_ == address(0)
         ) {
             revert NotConfigured(); // audit M-1: no zero routing destinations
         }
         prizeVault = prize_;
-        jackpotVault = jackpot_;
+        holderVault = holder_;
         leaderboardVault = leaderboard_;
         team = team_;
-        emit RoutingSet(prize_, jackpot_, leaderboard_, team_);
+        emit RoutingSet(prize_, holder_, leaderboard_, team_);
     }
 
     /// @notice One-way, irreversible: freeze convert()'s payout destinations forever (audit F2, pass-5).
@@ -134,7 +138,7 @@ contract Treasury is NonRenounceableOwnable2Step, ReentrancyGuard, IERC721Receiv
         // convert() forever. Require exactly what convert() demands (adapters + all four destinations).
         if (
             address(qpullWeth) == address(0) || address(wethQuotron) == address(0) || prizeVault == address(0)
-                || jackpotVault == address(0) || leaderboardVault == address(0) || team == address(0)
+                || holderVault == address(0) || leaderboardVault == address(0) || team == address(0)
         ) revert NotConfigured();
         routingLocked = true;
         emit RoutingLocked();
@@ -175,8 +179,12 @@ contract Treasury is NonRenounceableOwnable2Step, ReentrancyGuard, IERC721Receiv
     function convert(uint256 minWethOut, uint256 minQuotronOut) external nonReentrant onlyKeeper {
         if (
             address(qpullWeth) == address(0) || address(wethQuotron) == address(0) || prizeVault == address(0)
-                || jackpotVault == address(0) || leaderboardVault == address(0) || team == address(0)
-        ) revert NotConfigured(); // audit M-1: jackpot/leaderboard vaults are unconditional transfer targets
+                || holderVault == address(0) || leaderboardVault == address(0) || team == address(0)
+        ) revert NotConfigured(); // audit M-1: holder/leaderboard vaults are unconditional transfer targets
+        // pre-audit MEDIUM (treasury-convert): both per-call caps ship as 0 = "not configured", and convert()
+        // refuses to run until the owner arms BOTH pool-sized ceilings — H-1/H-3 fail CLOSED instead of
+        // silently uncapped. The setters reject 0, so a 0 here can only mean "never set".
+        if (maxConvertPerCall == 0 || maxWethConvertPerCall == 0) revert NotConfigured();
 
         // Tax arrives in TWO currencies since the V4 hook (audit H-2): buys pay QPULL, exact-in sells
         // pay WETH — QpullTaxHook take()s both straight to this Treasury. QPULL converts via leg 1;
@@ -240,13 +248,13 @@ contract Treasury is NonRenounceableOwnable2Step, ReentrancyGuard, IERC721Receiv
         //    global QUOTRON pause, which hit all four vaults at once — an accepted external-admin trust boundary;
         //    see SECURITY.md.) Zero-value legs are skipped (audit M-5): a thin batch floors the small legs to 0.
         uint256 qBal = quotron.balanceOf(address(this));
-        uint256 owedTotal = quotronOwed[prizeVault] + quotronOwed[jackpotVault] + quotronOwed[leaderboardVault];
+        uint256 owedTotal = quotronOwed[prizeVault] + quotronOwed[holderVault] + quotronOwed[leaderboardVault];
         uint256 splittable = qBal > owedTotal ? qBal - owedTotal : 0; // only the fresh conversion is split by ratio
-        uint256 toJackpot = (splittable * JACKPOT_BPS) / PRIZE_BPS;
+        uint256 toHolder = (splittable * HOLDER_BPS) / PRIZE_BPS;
         uint256 toLeaderboard = (splittable * LEADERBOARD_BPS) / PRIZE_BPS;
-        uint256 toHourly = splittable - toJackpot - toLeaderboard;
+        uint256 toHourly = splittable - toHolder - toLeaderboard;
         _trySendQuotron(prizeVault, toHourly);
-        _trySendQuotron(jackpotVault, toJackpot);
+        _trySendQuotron(holderVault, toHolder);
         _trySendQuotron(leaderboardVault, toLeaderboard);
 
         emit Converted(qpullIn, wethOut, qOut, teamWeth);
@@ -262,8 +270,13 @@ contract Treasury is NonRenounceableOwnable2Step, ReentrancyGuard, IERC721Receiv
         uint256 total = amount + quotronOwed[to];
         if (total == 0) return; // preserves the M-5 zero-value skip
         quotronOwed[to] = 0; // clear first; re-set below if the send still fails
-        (bool ok,) = address(quotron).call(abi.encodeCall(IERC20.transfer, (to, total)));
-        if (!ok) quotronOwed[to] = total; // still blocked: owe the full slice to THIS vault, retry next convert
+        // audit M-1 (pass-8): a standards-compliant ERC-20 may signal a blacklisted/failed transfer by
+        // RETURNING false rather than reverting — in which case the low-level call still reports ok==true.
+        // Decode and require the boolean (SafeERC20 discipline) so a non-reverting false re-owes to THIS
+        // vault instead of silently leaving the tokens un-owed for the next convert() to re-split to siblings.
+        (bool ok, bytes memory ret) = address(quotron).call(abi.encodeCall(IERC20.transfer, (to, total)));
+        bool success = ok && (ret.length == 0 || abi.decode(ret, (bool)));
+        if (!success) quotronOwed[to] = total; // still blocked: owe the full slice to THIS vault, retry next convert
     }
 
     /// @notice ERC-404 terminal-mint safety (§13.3), defense-in-depth. A convert() batch that buys ≥1

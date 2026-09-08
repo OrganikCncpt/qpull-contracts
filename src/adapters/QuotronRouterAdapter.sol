@@ -29,6 +29,7 @@ contract QuotronRouterAdapter is ISwapAdapter, Ownable2Step, ReentrancyGuard {
     event DeadlineBufferSet(uint256 seconds_);
     event TreasurySet(address treasury);
     event SweptETH(address indexed to, uint256 amount);
+    event RefundForwarded(address indexed to, uint256 amount); // pre-audit: unexpected router refund recaptured
 
     error UnsupportedPath();
     error MinOutRequired();
@@ -59,8 +60,9 @@ contract QuotronRouterAdapter is ISwapAdapter, Ownable2Step, ReentrancyGuard {
 
     /// @notice Owner-only rescue for native ETH stranded in this adapter (audit F7, pass-5). In normal
     ///         operation the adapter holds no ETH (WETH is unwrapped and forwarded to the router in the
-    ///         same tx); this recovers a router refund or force-sent ETH. Touches no WETH/QUOTRON
-    ///         accounting — the adapter never holds those between calls.
+    ///         same tx); this recovers force-sent ETH. A router refund no longer strands here — swapExactIn
+    ///         re-wraps and forwards it to the Treasury in the same call (pre-audit). Touches no
+    ///         WETH/QUOTRON accounting — the adapter never holds those between calls.
     function sweepETH(address to) external onlyOwner {
         if (to == address(0)) revert ZeroAddress();
         uint256 bal = address(this).balance;
@@ -86,9 +88,28 @@ contract QuotronRouterAdapter is ISwapAdapter, Ownable2Step, ReentrancyGuard {
         if (tokenIn != weth || tokenOut != quotron) revert UnsupportedPath();
         if (minOut == 0) revert MinOutRequired(); // the router rejects minOut==0 (InvalidAmount) — always set a floor
         IERC20(weth).safeTransferFrom(msg.sender, address(this), amountIn);
+        // Snapshot BEFORE unwrapping so any pre-existing force-sent balance (sweepETH's domain) is not
+        // mistaken for this call's refund.
+        uint256 ethBefore = address(this).balance;
         IWETH(weth).withdraw(amountIn); // WETH → native ETH
         amountOut = router.buyExactEth{ value: amountIn }(minOut, to, block.timestamp + deadlineBuffer);
         if (amountOut < minOut) revert Slippage(); // audit M-3: enforce the floor locally, not only via the router
+        // pre-audit (router ETH refund): buyExactEth is exact-ETH-in — the live router wraps the FULL msg.value
+        // and settles it as the v4 exact-input amount (fork-verified, test/fork/QuotronSwapFork.t.sol), so a
+        // refund is never expected. Should one ever arrive it lands on receive() below and, without this, would
+        // strand here outside convert()'s QUOTRON-only shortfall check until an owner sweepETH. We RECAPTURE
+        // rather than revert: `treasury` is write-once and Treasury.lockRouting() freezes the adapter binding,
+        // so a revert-on-refund would turn any future dust refund into a PERMANENT convert() brick (no prize
+        // funding, no fix path), whereas forwarding keeps convert() live and puts the value back into the
+        // pipeline (it becomes next batch's wethHeld). The refund is re-wrapped to WETH because the Treasury
+        // has no receive(); it goes to msg.sender (the Treasury, the only caller — audit H-1), never to `to`.
+        // Bounded: the minOut floor above already caps how much of amountIn could come back unconverted.
+        uint256 refund = address(this).balance - ethBefore; // >= 0: ETH only leaves via the value call above
+        if (refund > 0) {
+            IWETH(weth).deposit{ value: refund }();
+            IERC20(weth).safeTransfer(msg.sender, refund);
+            emit RefundForwarded(msg.sender, refund);
+        }
     }
 
     /// @inheritdoc ISwapAdapter
@@ -99,5 +120,5 @@ contract QuotronRouterAdapter is ISwapAdapter, Ownable2Step, ReentrancyGuard {
         revert("quote off-chain: pass minOut to swapExactIn");
     }
 
-    receive() external payable { } // ETH from WETH.withdraw
+    receive() external payable { } // ETH from WETH.withdraw (and any router refund, forwarded in swapExactIn)
 }

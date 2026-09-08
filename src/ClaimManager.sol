@@ -38,6 +38,11 @@ contract ClaimManager is IClaimManager, Ownable2Step, ReentrancyGuard {
     // after which the engine<->vault map is frozen forever — the same "immutable after launch" posture as
     // BaseVault.controller (M-14/H-10). Deploy arms this at the end of wiring.
     bool public enginesLocked;
+    // pre-audit (lockEngines completeness): how many engines currently hold a non-zero binding. Maintained by
+    // setEngine (0 -> bound increments, bound -> 0 decrements, a rebind is neutral) so lockEngines can require
+    // the supplied list to be EXACTLY the bound set. The old check verified only the pairs it was handed, so a
+    // bound engine omitted from the list was invisible to it and the lock froze a map nobody had fully verified.
+    uint256 public engineCount;
 
     event EngineSet(address indexed engine, address indexed vault);
     event EnginesLocked();
@@ -59,6 +64,7 @@ contract ClaimManager is IClaimManager, Ownable2Step, ReentrancyGuard {
     error EnginesAlreadyLocked(); // audit F1 (pass-5)
     error OnlySelf(); // audit L5 (job-745): settleSelf is an internal self-call only
     error IncompleteBindings(); // audit L2 (job-745): lockEngines refuses an incomplete engine map
+    error ZeroEngine(); // preaudit: address(0) is not an engine; binding it would pad engineCount
 
     constructor(address initialOwner) Ownable(initialOwner) { }
 
@@ -67,6 +73,15 @@ contract ClaimManager is IClaimManager, Ownable2Step, ReentrancyGuard {
     /// @dev    audit F1 (pass-5): reverts once lockEngines() has been called — the bindings are then final.
     function setEngine(address e, address vault) external onlyOwner {
         if (enginesLocked) revert EnginesAlreadyLocked();
+        // preaudit: address(0) can never call registerClaim, yet binding it would count toward engineCount and
+        // let a lockEngines list carry a phantom (0, vault) pair in place of a real engine. Refuse the key.
+        if (e == address(0)) revert ZeroEngine();
+        address prev = engineVault[e];
+        if (prev == address(0) && vault != address(0)) {
+            ++engineCount; // fresh bind
+        } else if (prev != address(0) && vault == address(0)) {
+            --engineCount; // de-authorize (a bound -> bound rebind leaves the count untouched)
+        }
         engineVault[e] = vault;
         emit EngineSet(e, vault);
     }
@@ -78,11 +93,20 @@ contract ClaimManager is IClaimManager, Ownable2Step, ReentrancyGuard {
     /// @dev    audit L2 (job-745): the caller passes the EXACT expected (engine, vault) pairs and each is
     ///         verified live before the freeze — so a lock issued before wiring is complete reverts instead
     ///         of permanently bricking an unbound game's registerClaim.
+    ///         pre-audit (completeness): the list must also be the WHOLE bound set — its length equals
+    ///         engineCount and no engine repeats (a duplicate could pad the length while a real engine is
+    ///         missing). Together with the live per-pair check this proves list == bound set, so an engine
+    ///         that was bound but left off the list can no longer be frozen unverified. The one case no
+    ///         on-chain check can see is an engine that was NEVER bound and is ALSO absent from the list; the
+    ///         list is the operator's expected set, so include every game engine and the check catches it.
     function lockEngines(address[] calldata engines, address[] calldata vaults) external onlyOwner {
         uint256 n = engines.length;
-        if (n == 0 || n != vaults.length) revert IncompleteBindings();
+        if (n == 0 || n != vaults.length || n != engineCount) revert IncompleteBindings();
         for (uint256 i; i < n; ++i) {
             if (vaults[i] == address(0) || engineVault[engines[i]] != vaults[i]) revert IncompleteBindings();
+            for (uint256 j; j < i; ++j) {
+                if (engines[j] == engines[i]) revert IncompleteBindings(); // duplicate would mask an omission
+            }
         }
         enginesLocked = true;
         emit EnginesLocked();

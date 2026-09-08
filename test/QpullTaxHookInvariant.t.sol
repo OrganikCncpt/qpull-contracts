@@ -69,11 +69,13 @@ abstract contract HookFuzzBase is Test {
             tickSpacing: TICK_SPACING,
             treasury: feeSink,
             packRegistry: address(rec),
-            jackpotRegistry: address(rec),
             leaderboardRegistry: address(rec),
             nft: address(nft),
             exemptSender: address(adapter),
-            initializer: address(this)
+            initializer: address(this),
+            // throttle not under test here: an uncapped first-hour buy size keeps this fixture's
+            // pre-existing swap sizes valid (the fixture warps past the gate window anyway)
+            earlyBuyCapWei: type(uint256).max
         });
         deployCodeTo("src/hooks/QpullTaxHook.sol:QpullTaxHook", abi.encode(hc), hookAddr);
         hook = QpullTaxHook(hookAddr);
@@ -94,7 +96,9 @@ abstract contract HookFuzzBase is Test {
         manager.initialize(key, SQRT_1_1);
         vm.prank(address(this), address(this)); // audit F6: tx.origin == initializer for the LP seed
         liqRouter.modifyLiquidity(key, IV4PoolManager.ModifyLiquidityParams(FULL_LO, FULL_HI, 1e24, 0), "");
-        vm.warp(block.timestamp + 2 hours); // past the first-hour gate — fuzz actors need not hold an NFT
+        // Past BOTH the first-hour gate (fuzz actors need not hold an NFT) AND the 48h sell-tax decay
+        // window, so sells settle at the flat 4% floor and the 4%-of-gross assertions hold on both sides.
+        vm.warp(block.timestamp + hook.SELL_DECAY() + 1);
     }
 
     function _buyZeroForOne() internal view returns (bool) {

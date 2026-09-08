@@ -31,11 +31,11 @@ contract HookMinerTest is Test {
             tickSpacing: 60,
             treasury: makeAddr("treasury"),
             packRegistry: address(rec),
-            jackpotRegistry: address(rec),
             leaderboardRegistry: address(rec),
             nft: address(nft),
             exemptSender: makeAddr("adapter"),
-            initializer: address(this)
+            initializer: address(this),
+            earlyBuyCapWei: type(uint256).max // throttle not under test here
         });
 
         bytes memory initCode = abi.encodePacked(type(QpullTaxHook).creationCode, abi.encode(hc));
