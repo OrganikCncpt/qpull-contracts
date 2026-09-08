@@ -3,10 +3,12 @@ out/
 cache/
 broadcast/
 
-# Dependencies: OpenZeppelin + forge-std are installed via `forge install` (see README).
-# v4-core is VENDORED (committed under lib/v4-core) so the tax-hook tests compile as-is.
+# Dependencies are ALL VENDORED (committed) so `git clone && forge build` works with zero setup:
+# v4-core v4.0.0, forge-std v1.16.2 (src only), openzeppelin-contracts v5.1.0 (contracts only).
 lib/*
 !lib/v4-core
+!lib/forge-std
+!lib/openzeppelin-contracts
 
 # Secrets & local config
 .env

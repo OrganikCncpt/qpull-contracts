@@ -1,7 +1,7 @@
 # QTIP protocol — Foundry config
 # Install toolchain:  curl -L https://foundry.paradigm.xyz | bash && foundryup
-# Install deps:       forge install foundry-rs/forge-std@v1.16.2 OpenZeppelin/openzeppelin-contracts@v5.1.0
-# v4-core v4.0.0 is VENDORED under lib/v4-core (committed) — no install needed for it.
+# Deps: ALL VENDORED under lib/ (v4-core v4.0.0, forge-std v1.16.2, openzeppelin-contracts v5.1.0).
+# No `forge install` needed: `git clone && forge build` works as-is.
 
 [profile.default]
 src = "src"
