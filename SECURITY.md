@@ -726,12 +726,14 @@ wanted is stated. Disagreement with the reasoning is welcome; re-deriving the fa
 | 16.1 | No pause / circuit breaker on draws or claims; no kill switch | Design decision | Accepted, will not be added |
 | 16.2 | Daily raffle `REVEAL_LAG` (1h) below the 4-day sequencer back-dating bound | Chain trust assumption | Accepted, bounded; weekly games unaffected |
 | 16.3 | Hook-fee scope: a hookless parallel pool trades untaxed | Inherent to V4 per-pool hooks | Accepted, monitored |
-| 16.4 | Immutable drand dependency | External liveness | Recurring draws fail safe; one-shot NFT reveal gets a non-discretionary fallback ladder |
+| 16.4 | Immutable drand dependency | External liveness | Recurring draws fail safe. **CORRECTED 2026-09-08: the one-shot NFT reveal ladder's reasoning does NOT hold — it binds an ALREADY-PUBLISHED round (external audit NFTCollection F-1). Fix queued; do NOT classify a reveal-ladder finding against this row.** |
 | 16.5 | Launch throttle: uncapped early-accumulation tail | Documented design ceiling | Accepted, immutable |
-| 16.6 | `lockRouting()` + write-once adapters are permanent | Immutability trade-off | Accepted; lock timing moved to the final verified go-live step |
+| 16.6 | `lockRouting()` + write-once adapters are permanent | Immutability trade-off | Accepted; lock timing moved to the final verified go-live step. **CORRECTED 2026-09-08: the claim that the owner-mutable convert caps "are not a rug lever" is WRONG (external audit Treasury F-5) — caps + `setKeeper` + `minOut=0` extracts via slippage. Do NOT classify a cap/keeper finding against this row.** |
 | 16.7 | Rip-XP claim window lets a holder pick one of two adjacent leaderboard weeks (M-2) | Negligible-value gameable choice | Accepted; comment corrected, code deliberately unchanged |
 | 16.8 | Pledge-flood against the free-entry pledge region (pre-audit LOW), plus FS-3b post-beacon pledge re-seating (full-stack audit) | Bounded, non-profitable griefing; FS-3b is bounded post-beacon selection | Accepted, bounded (void share `q^6` per seat, seats independent since the seat-nonce cascade fix); SR seats immune to the flood by the SR-first pick, and their membership frozen by the FS-3 fix; pruning the flood out of `wb` and closing **FS-3b** (pledge band still re-rolls on live ownership) deferred to the external audit |
 | 16.9 | Robinhood Chain censorship: ArbOS 61 tx filtering rejects even force-included txs, so no L1 forced-inclusion escape hatch | Inherent chain trust assumption | Accepted, unmitigable in code; bounds only liveness of a user's own tx (no fund loss), draws void-on-miss |
+| 16.10 | Launch gate can be satisfied ON BEHALF OF non-holders by a pass-holding relayer / ERC-4337 bundler (`tx.origin` is the bundler) | `tx.origin` is the only unspoofable identity available to an immutable hook | Accepted, self-throttling: the gate and the throttle key on the SAME `tx.origin`, so the whole channel shares one 2-minute cooldown and the 0.25 ETH first-10 cap, and the bundler's own pass is transfer-locked |
+| 16.11 | `beforeAdd/RemoveLiquidity` admit `tx.origin == initializer`, so any contract the initializer EOA transacts with can add or remove canonical-pool liquidity in that transaction (external audit F-1) | Needed so the initializer can route liquidity through a generic v4 router | Accepted for launch, bounded operationally (retire the initializer EOA after go-live; seed LP THROUGH `QpullLiquidityLock`); structural fix deferred to the external audit |
 
 ### 16.1 No pause, no circuit breaker, no kill switch (by design)
 
@@ -796,6 +798,31 @@ wanted is stated. Disagreement with the reasoning is welcome; re-deriving the fa
   and the ladder only steps while no beacon for the current binding exists. It adds liveness without adding
   a rarity lever. The recurring draws deliberately get no ladder; void-on-miss is their backstop.
 
+- **CORRECTION (external audit 2026-09-08, `NFTCollection` F-1). Property (2) above is TRUE but does not
+  support the conclusion drawn from it, and this residual must not be used to defend the reveal ladder.**
+  The property conflates *non-discretionary* with *unpredictable*. Only the second is load-bearing, and the
+  ladder has the first without the second. `advanceRevealFallback` gates on `block.timestamp >= rungTime`,
+  then binds `drand.roundAt(rungTime)` — the round at an instant that has **already passed**, so its beacon
+  is already public in drand's archive at the moment it is bound. The caller cannot choose *which* round the
+  arithmetic yields, but they choose *when* to call, they can read the candidate beacon before calling, and
+  `revealFallbackRung` is a bare counter rather than a function of elapsed time, so once several rungs are
+  due a single transaction can walk them, stop on whichever already-published beacon gives the most
+  favorable rarity map across the 3,500 passes, and weld it in through the permissionless `submitBeacon` in
+  that same transaction. Contrast `finalizeLaunch` (`src/NFTCollection.sol:622`), which binds
+  `roundAt(block.timestamp + revealDelay)`: genuinely future, genuinely unknowable. The distinction the
+  original text missed is that determinism defends against an *owner* choosing the round, and does nothing
+  against a *caller* choosing the moment.
+- **FIXED 2026-09-08.** `advanceRevealFallback` now binds `drand.roundAt(block.timestamp + revealDelay)` —
+  a FUTURE, unknowable round, the same construction `finalizeLaunch` already used — and re-anchors
+  `revealBoundAt` on every advance, so exactly one advance is possible per `REVEAL_FALLBACK_STEP()` however
+  late the call. The rung counter is now observability only, not a round selector. The constructor invariant
+  `revealDelay < REVEAL_FALLBACK_STEP()` now carries its true meaning: the newly bound round always falls due
+  BEFORE the next rung, so it gets a real chance to land. Regression tests:
+  `test_f1_fallbackNeverBindsAnAlreadyPublishedRound` and `test_f1_cannotWalkMultipleRungsInOneBlock`.
+  NOTE for reviewers: four prior tests had to be INVERTED, two of which had certified the defect —
+  one was titled "TIME-DETERMINISM (no grinding)" and pinned the very determinism that made already-published
+  beacons selectable; another asserted in a comment that walking rungs in the same block "is fine".
+
 ### 16.5 Launch throttle: the uncapped early-accumulation tail
 
 - Inside the launch window the hook enforces the NFT-holder gate (`GATE_DURATION()`, 2h), `BUY_COOLDOWN()`
@@ -829,6 +856,33 @@ wanted is stated. Disagreement with the reasoning is welcome; re-deriving the fa
   funds or change the split, so they are not a rug lever. They are now **fail-closed**: `0` means "not
   configured" and `convert()` reverts `NotConfigured` until both are set; the go-live sequence asserts both
   are `!= 0` and `!= type(uint256).max` before routing is locked.
+
+- **CORRECTION (external audit 2026-09-08, `Treasury` F-5). The sentence "They cannot redirect funds or
+  change the split, so they are not a rug lever" is WRONG, and this residual must not be used to defend the
+  unfrozen cap setters or `setKeeper`.** The premise is true; the conclusion does not follow, because value
+  leaves the Treasury through swap **slippage** without any destination changing. `setKeeper` is likewise
+  never lock-gated (deliberately, as a rotatable hot key), so post-lock a compromised owner key runs
+  `setMaxWethConvertPerCall(type(uint256).max)` then `setKeeper(self, true)` then `convert(0, 0)`. Every
+  destination holds perfectly — the team takes its 20%, the three vaults take their QUOTRON — but an
+  uncapped slice pushed through the shallow QUOTRON pool with `minQuotronOut = 0` is a free sandwich, and
+  the difference is the attacker's. **The `!= type(uint256).max` bound cited in the bullet above lives in
+  `script/GoLiveMainnet.s.sol`, which has already run by that point; the on-chain setter only rejects `0`.**
+  So "bounded, cap-limited convert MEV" is bounded by the owner, not by the code.
+  - **The mitigation that actually applies** is the ownership migration: `LAUNCH-CHECKLIST.md` §5 gates on
+    `owner() == Timelock+multisig` for every ownable contract, after go-live step 6. It bounds this exposure
+    to the timelock delay. That checkbox is now load-bearing for this residual and must not be skipped.
+  - **What does NOT fix it**, so neither is proposed: restricting post-lock cap changes to *tightening only*
+    contradicts this section's own requirement that the caps track pool depth over time (the LP is
+    permanently locked and retains fees, so depth only grows and the caps must be able to rise); and an
+    on-chain floor derived from `ISwapAdapter.quote()` is spot-priced, which the same sandwich moves inside
+    the same transaction.
+  - **FIXED 2026-09-08.** The `!= type(uint256).max` bound now lives in `setMaxConvertPerCall` and
+    `setMaxWethConvertPerCall` themselves (`CapTooLarge`), so it survives the go-live script instead of
+    expiring with it. Ordinary post-lock re-tuning is deliberately unaffected — only the literal max is
+    refused — and `test_capsRemainMutableAfterLockRouting` pins that the caps still move in BOTH directions
+    after the lock, because this section requires them to track pool depth. `lockRouting()` additionally now
+    refuses to lock until both caps are armed (external audit F-8), which reordered
+    `script/DeployTestnet.s.sol` to arm them before its in-deploy lock.
 
 ### 16.7 Rip-XP: the two-week choice (re-audit M-2, pre-audit LOW)
 
@@ -982,3 +1036,42 @@ against source and are addressed above; the residual QUOTRON-admin trust surface
 by the §9 launch check. Pass-4's F4 / pass-5's F6 (V4 liquidity-callback tax gap) is now **resolved** —
 liquidity provision is restricted to the protocol, with the gate covering both ADD and REMOVE after
 pass-6's L1 (hook re-mined to `0x1A44`, §12–13).*
+
+### 16.10 Launch gate is satisfiable on behalf of non-holders by a pass-holding relayer (bounded, self-throttling)
+
+- **The property.** The 2-hour launch gate is `nft.balanceOf(tx.origin) == 0 -> revert Gated()`. `tx.origin` is
+  the EOA that signed the transaction, which is the one identity a sniper cannot delegate away: routing through
+  a contract does not help (that is `msg.sender`), `hookData` is ignored, and EIP-7702 delegation leaves
+  `tx.origin` as the delegating EOA. Borrowing a pass for a single transaction also fails to unwind, because a
+  gated buy sets `earlyBuyer[tx.origin].buys > 0` and `NFTCollection._enforceLaunchLock` then reverts
+  `PassLockedDuringLaunch` on any transfer FROM that wallet for the rest of the window, so one pass can never
+  unlock a second buying wallet.
+- **The residual.** Under ERC-4337 the bundler EOA is `tx.origin`. A bundler that holds a pass therefore
+  satisfies the gate for every UserOp in its bundle, so non-holders can buy during the gate window through it.
+  This is the inverse of the documented F6/F8 attribution trade-off (there the bundler CAPTURES rewards; here it
+  LENDS gate eligibility).
+- **Why it is accepted.** The throttle keys on the SAME `tx.origin` as the gate, deliberately, so the channel
+  throttles itself: every buy routed through that bundler shares one `BUY_COOLDOWN` (2 minutes) and the
+  `earlyBuyCapWei` (0.25 ETH) cap on the first `EARLY_BUY_COUNT` (10) buys. Over a 2-hour window that bounds the
+  entire channel at roughly 60 buys, the first ten of them small, and the bundler's own pass is transfer-locked
+  for the window. The hook is immutable, and no alternative identity is both unspoofable and available onchain.
+
+### 16.11 Liquidity gate admits `tx.origin == initializer` (external audit F-1; accepted for launch)
+
+- **The property.** `_onlyProtocolLp` admits a liquidity add or remove when `sender == initializer` OR
+  `tx.origin == initializer`. The `tx.origin` branch exists so the initializer EOA can add liquidity through a
+  generic v4 router, where `sender` is the router rather than the EOA.
+- **The residual.** Any contract the initializer EOA signs a transaction with can add or remove liquidity on the
+  canonical pool inside that transaction. An attacker who phishes the initializer once can stand up a
+  single-sided position with their own capital, let organic taxed flow convert it, and withdraw it untaxed after
+  phishing a second transaction. **The previously stated rationale that the symmetric remove gate is
+  defense-in-depth against this case does not hold**, because the same branch gates both legs; that comment has
+  been corrected in `QpullTaxHook`. The remove gate does still stop a pure third party, who is neither `sender`
+  nor `tx.origin`, from withdrawing a position.
+- **Why it is accepted for launch.** It requires the initializer key to be phished, which is the same trust
+  boundary that already governs the entire deploy. It is bounded operationally: seed LP THROUGH
+  `QpullLiquidityLock` (which `GoLiveMainnet` does, so the protocol position is owned by a contract with no
+  removal path) and treat the initializer EOA as a launch-only key retired after go-live. The structural fix is
+  to drop the `tx.origin` branch and allowlist the LP-manager contract as `sender`; because the hook is
+  immutable that changes the deployed address, so it is deferred to the external audit together with a
+  confirmation that no go-live step needs the EOA route.

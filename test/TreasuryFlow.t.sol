@@ -23,7 +23,11 @@ contract TreasuryFlowTest is Test {
 
     // The per-call caps ship FAIL-CLOSED (0 = NotConfigured, pre-audit medium). Tests that do not exercise the
     // caps arm them wide open so the rest of the convert() behaviour is unchanged; cap tests set their own.
-    uint256 constant UNCAPPED = type(uint256).max;
+    // external audit F-5: setMax*PerCall now rejects type(uint256).max on-chain (the bound used to live
+    // only in script/GoLiveMainnet.s.sol, which has already run by the time a compromised owner would
+    // use it). These fixtures used max as shorthand for "uncapped for this test", not as an assertion
+    // about max itself, so a large finite sentinel preserves the intent.
+    uint256 constant UNCAPPED = type(uint256).max / 2;
 
     function setUp() public {
         qpull = new MockERC20();
@@ -83,6 +87,78 @@ contract TreasuryFlowTest is Test {
     }
 
     /// The 0 sentinel is only meaningful because the setter refuses it (mirror of the WETH test below).
+    /// VARIANT of pre-submission review N-4, found on BaseVault and swept to Treasury: both had an
+    /// unconditional onERC721Received and neither has ANY ERC-721 egress, so a misdirected safeTransferFrom
+    /// to a published deploy address destroyed the token instead of reverting.
+    function test_n4variant_treasuryRejectsNftFromAnyoneButQuotron() public {
+        address stranger = makeAddr("nftStranger");
+        vm.prank(stranger);
+        vm.expectRevert(Treasury.UnexpectedNft.selector);
+        treasury.onERC721Received(stranger, stranger, 1, "");
+        // QUOTRON's own terminal mint is still accepted, which is the documented purpose
+        vm.prank(address(quotron));
+        bytes4 sel = treasury.onERC721Received(address(quotron), address(treasury), 7, "");
+        assertEq(sel, Treasury.onERC721Received.selector, "QUOTRON auto-mint still accepted");
+    }
+
+    // ── Wave 1 external-audit fixes: each of these FAILS against pre-fix code ──────────────────────
+
+    /// external audit F-5. The only bound on the convert caps lived in script/GoLiveMainnet.s.sol, which has
+    /// already run by the time a compromised owner would raise them. Post-lock: cap -> max, self-grant keeper,
+    /// convert(0,0) sandwiches an uncapped slice through the shallow QUOTRON pool. Destinations hold; value
+    /// leaves as slippage. The bound has to survive the script, so it lives in the setter now.
+    function test_f5_caps_rejectMaxUint() public {
+        vm.expectRevert(Treasury.CapTooLarge.selector);
+        treasury.setMaxConvertPerCall(type(uint256).max);
+        vm.expectRevert(Treasury.CapTooLarge.selector);
+        treasury.setMaxWethConvertPerCall(type(uint256).max);
+        // one below max is still allowed: ordinary re-tuning must keep working, since the caps have to track
+        // pool depth as the permanently-locked LP accrues fees.
+        treasury.setMaxConvertPerCall(type(uint256).max - 1);
+        assertEq(treasury.maxConvertPerCall(), type(uint256).max - 1, "finite caps still settable");
+    }
+
+    /// external audit F-1(a). owedTotal sums quotronOwed at the three CURRENT role addresses, so two roles
+    /// sharing an address double-counts it and permanently under-computes `splittable`.
+    function test_f1_setRouting_rejectsAliasedVaults() public {
+        Treasury t = new Treasury(address(qpull), address(weth), address(quotron), address(this));
+        vm.expectRevert(Treasury.VaultsNotDistinct.selector);
+        t.setRouting(prizeVault, prizeVault, leaderboardVault, team);
+        vm.expectRevert(Treasury.VaultsNotDistinct.selector);
+        t.setRouting(prizeVault, holderVault, holderVault, team);
+        vm.expectRevert(Treasury.VaultsNotDistinct.selector);
+        t.setRouting(prizeVault, holderVault, prizeVault, team);
+        // team may still equal a vault: it takes WETH, never QUOTRON, so it is not part of owedTotal.
+        t.setRouting(prizeVault, holderVault, leaderboardVault, prizeVault);
+        assertEq(t.team(), prizeVault, "team is not constrained by the distinctness rule");
+    }
+
+    /// external audit F-9. The three token bindings are immutable with no re-deploy path.
+    function test_f9_constructor_rejectsZeroTokens() public {
+        vm.expectRevert(Treasury.NotConfigured.selector);
+        new Treasury(address(0), address(weth), address(quotron), address(this));
+        vm.expectRevert(Treasury.NotConfigured.selector);
+        new Treasury(address(qpull), address(0), address(quotron), address(this));
+        vm.expectRevert(Treasury.NotConfigured.selector);
+        new Treasury(address(qpull), address(weth), address(0), address(this));
+    }
+
+    /// external audit F-8. convert() requires both caps, so a lock that verified only the six addresses
+    /// promised a completeness it did not check.
+    function test_f8_lockRouting_requiresCapsArmed() public {
+        Treasury t = new Treasury(address(qpull), address(weth), address(quotron), address(this));
+        t.setAdapters(address(qpullWeth), address(wethQuotron));
+        t.setRouting(prizeVault, holderVault, leaderboardVault, team);
+        vm.expectRevert(Treasury.NotConfigured.selector);
+        t.lockRouting(); // caps unarmed
+        t.setMaxConvertPerCall(1_000e18);
+        vm.expectRevert(Treasury.NotConfigured.selector);
+        t.lockRouting(); // only one armed
+        t.setMaxWethConvertPerCall(1_000e18);
+        t.lockRouting();
+        assertTrue(t.routingLocked(), "locks once both caps are armed");
+    }
+
     function test_setMaxConvertPerCall_rejectsZero() public {
         vm.expectRevert(Treasury.BelowThreshold.selector);
         treasury.setMaxConvertPerCall(0);
@@ -90,20 +166,37 @@ contract TreasuryFlowTest is Test {
 
     /// lockRouting() deliberately does NOT require the caps (they are pool-sized, tuned at go-live, and stay
     /// owner-mutable after the lock, audit L-6) — but a locked Treasury with unset caps still fails closed.
-    function test_capsUnsetStillNotConfiguredAfterLockRouting() public {
+    /// SUPERSEDED IN PART by external audit F-8 (2026-09-08). This used to lock routing with the caps UNSET
+    /// and assert convert() then reverted NotConfigured. lockRouting() now refuses that state outright
+    /// (see test_f8_lockRouting_requiresCapsArmed), so that half of the old assertion is unreachable by
+    /// construction, which is strictly stronger. The OTHER half is still load-bearing and is what this test
+    /// now pins: the caps are deliberately NOT frozen by the routing lock. SECURITY.md 16.6 depends on that
+    /// — the caps must keep tracking pool depth as the permanently-locked LP accrues fees — and F-5's fix
+    /// (rejecting type(uint256).max) must NOT have turned ordinary post-lock re-tuning into a revert.
+    function test_capsRemainMutableAfterLockRouting() public {
         Treasury t = new Treasury(address(qpull), address(weth), address(quotron), address(this));
         t.setAdapters(address(qpullWeth), address(wethQuotron));
         t.setRouting(prizeVault, holderVault, leaderboardVault, team);
         t.setKeeper(address(this), true);
+        t.setMaxConvertPerCall(1_000e18); // F-8: both caps must be armed BEFORE the lock
+        t.setMaxWethConvertPerCall(1_000e18);
         t.lockRouting();
-        qpull.mint(address(t), 1e18);
-        vm.expectRevert(Treasury.NotConfigured.selector);
-        t.convert(0, 0);
-        // the caps are NOT frozen by the routing lock: arming them afterwards opens the pipeline
+
+        // routing itself is frozen forever
+        vm.expectRevert(Treasury.RoutingAlreadyLocked.selector);
+        t.setRouting(prizeVault, holderVault, leaderboardVault, team);
+
+        // ...but the caps are not, in EITHER direction: they must track pool depth over time.
         t.setMaxConvertPerCall(UNCAPPED);
         t.setMaxWethConvertPerCall(UNCAPPED);
+        assertEq(t.maxConvertPerCall(), UNCAPPED, "cap raised post-lock");
+        t.setMaxConvertPerCall(500e18);
+        assertEq(t.maxConvertPerCall(), 500e18, "cap lowered post-lock");
+
+        // and the pipeline works with the re-tuned caps
+        qpull.mint(address(t), 1e18);
         t.convert(0, 0);
-        assertEq(qpull.balanceOf(address(t)), 0, "converts once the caps are armed post-lock");
+        assertEq(qpull.balanceOf(address(t)), 0, "converts with post-lock re-tuned caps");
     }
 
     function test_convertSplitsCorrectly() public {

@@ -5,6 +5,8 @@ import { Test } from "forge-std/Test.sol";
 import { BaseVault } from "../src/BaseVault.sol";
 import { MockERC20 } from "./mocks/MockERC20.sol";
 import { Ownable } from "@openzeppelin/contracts/access/Ownable.sol";
+import { IERC721Receiver } from "@openzeppelin/contracts/token/ERC721/IERC721Receiver.sol";
+import { NonRenounceableOwnable2Step } from "../src/utils/NonRenounceableOwnable2Step.sol";
 
 /// @notice FS-4 (fullstack audit): BaseVault is the sole custodian of all prize QUOTRON, and its guards
 ///         (onlyController, the pay-out-never-dips-into-reserve invariant, reserve/release accounting) were
@@ -28,6 +30,58 @@ contract BaseVaultTest is Test {
         vm.prank(owner);
         vault.setController(controller);
         quotron.mint(address(vault), FUND);
+    }
+
+    // ─── pre-submission review fixes (both FAIL against pre-fix code) ─────────
+
+    /// N-3. BaseVault was on NonRenounceableOwnable2Step's EXEMPT list, justified as "vestigial AFTER
+    /// setController". The justification is order-dependent; the exemption was not. Deploy.s.sol constructs
+    /// the vaults in one transaction and wires the controller in a LATER one, so a revert in between (or a
+    /// compromised deployer key, for which this is the cheapest one-shot kill) could renounce and leave
+    /// setController permanently uncallable and every QUOTRON later routed here permanently frozen.
+    function test_n3_cannotRenounceBeforeController() public {
+        BaseVault fresh = _freshUnset();
+        vm.prank(owner);
+        vm.expectRevert(NonRenounceableOwnable2Step.OwnershipCannotBeRenounced.selector);
+        fresh.renounceOwnership();
+        // still wireable, which is the whole point
+        vm.prank(owner);
+        fresh.setController(controller);
+        assertEq(fresh.controller(), controller, "vault still wireable after the refused renounce");
+    }
+
+    /// N-3, after wiring: still refused. Harmless either way (the owner has no powers left), but the
+    /// guarantee should not depend on WHEN it is called.
+    function test_n3_cannotRenounceAfterController() public {
+        vm.prank(owner);
+        vm.expectRevert(NonRenounceableOwnable2Step.OwnershipCannotBeRenounced.selector);
+        vault.renounceOwnership();
+        assertEq(vault.owner(), owner, "owner intact");
+    }
+
+    /// N-4. The 721 hook accepted ANY token from ANY sender. There is exactly one outbound call in this
+    /// contract (quotron.safeTransfer), no transferFrom, no rescue and nothing virtual, so anything else
+    /// that landed here was destroyed — and parking >= MIN_HOLD passes made qualifiedSince[vault]
+    /// permanently un-clearable, turning the vault into a forever-eligible holder-draw candidate whose
+    /// claims can never be settled. All three vault addresses are published deploy output.
+    function test_n4_rejectsNftFromAnyoneButQuotron() public {
+        vm.prank(stranger);
+        vm.expectRevert(BaseVault.UnexpectedNft.selector);
+        vault.onERC721Received(stranger, stranger, 1, "");
+
+        // a plausible accident: someone safeTransferFrom's a real pass to a published vault address
+        address passCollection = makeAddr("NFTCollection");
+        vm.prank(passCollection);
+        vm.expectRevert(BaseVault.UnexpectedNft.selector);
+        vault.onERC721Received(passCollection, winner, 42, "");
+    }
+
+    /// N-4 must not break the documented §13.3 purpose: QUOTRON's own ERC-404 auto-mint always calls with
+    /// msg.sender == quotron, and that path still has to be accepted or a whole-unit crossing could revert.
+    function test_n4_stillAcceptsQuotronsOwnAutoMint() public {
+        vm.prank(address(quotron));
+        bytes4 sel = vault.onERC721Received(address(quotron), address(vault), 7, "");
+        assertEq(sel, IERC721Receiver.onERC721Received.selector, "QUOTRON terminal mint still accepted");
     }
 
     // ─── setController (write-once, owner-only, non-zero) ─────────────────────
@@ -148,7 +202,11 @@ contract BaseVaultTest is Test {
 
     // ─── onERC721Received (ERC-404 whole-unit terminal receipt never reverts) ─
 
-    function test_onERC721Received_returnsSelector() public view {
+    /// NARROWED by pre-submission review N-4: the hook used to return the selector for ANY caller, which is
+    /// what made the vault a one-way ERC-721 sink. The selector contract still holds, but only for QUOTRON —
+    /// see test_n4_rejectsNftFromAnyoneButQuotron for the branch this test used to cover by accident.
+    function test_onERC721Received_returnsSelectorForQuotron() public {
+        vm.prank(address(quotron));
         bytes4 sel = vault.onERC721Received(address(0), address(0), 1, "");
         assertEq(sel, BaseVault.onERC721Received.selector);
     }

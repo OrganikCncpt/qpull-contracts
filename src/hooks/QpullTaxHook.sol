@@ -288,8 +288,18 @@ contract QpullTaxHook is ReentrancyGuardTransient {
     ///         (WETH->QPULL to buy, QPULL->WETH to sell), then withdraw — QPULL moved at 0% instead of 4%,
     ///         starving the prize funding. BOTH add and remove are gated to the pool's `initializer` (audit
     ///         L1 / job-745 added the symmetric remove gate): gating add restricts who can create a position,
-    ///         and gating remove is defense-in-depth so that even if a position were ever slipped in via a
-    ///         phished-initializer add (the tx.origin branch), a non-initializer still cannot withdraw it.
+    ///         and gating remove stops a THIRD PARTY (neither `sender` nor `tx.origin` the initializer) from
+    ///         withdrawing a position that ever slipped in.
+    ///         CAVEAT, do not overstate this (external audit F-1): the remove gate is NOT defense-in-depth
+    ///         against the phishing case, because the same `tx.origin == initializer` branch that would let a
+    ///         malicious contract ADD a position also lets it REMOVE one -- it just needs the initializer EOA
+    ///         to transact with it a second time. So the residual is: any contract the initializer signs a
+    ///         transaction with can add or remove liquidity on the canonical pool within that transaction.
+    ///         Operationally this is bounded by treating the initializer EOA as a launch-only key and retiring
+    ///         it after go-live (SECURITY.md: never seed LP directly from the deployer; seed THROUGH
+    ///         QpullLiquidityLock). The structural fix would be to drop the tx.origin branch and allowlist the
+    ///         LP-manager contract as `sender`; that is deferred to the external audit because this hook is
+    ///         immutable and the go-live path must be confirmed to never need the EOA route.
     ///         Identity is `sender` (a protocol LP-manager contract) OR `tx.origin` (the initializer EOA
     ///         signing through a router) — the same unspoofable identity the launch gate uses. Fails
     ///         closed. Trade-off (accepted): no permissionless community LP; protocol LP withdrawal must also

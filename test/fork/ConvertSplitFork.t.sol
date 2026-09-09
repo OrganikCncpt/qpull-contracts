@@ -47,8 +47,9 @@ contract ConvertSplitForkTest is Test {
         treasury.setAdapters(address(wethQuotron), address(wethQuotron));
         treasury.setRouting(address(raffleVault), address(holderVault), address(leaderVault), team);
         // The per-call caps ship fail-CLOSED (0 = NotConfigured, pre-audit medium); arm them (go-live step 1).
-        treasury.setMaxConvertPerCall(type(uint256).max);
-        treasury.setMaxWethConvertPerCall(type(uint256).max);
+        // external audit F-5: max is now rejected on-chain; a large finite value keeps "uncapped" intent.
+        treasury.setMaxConvertPerCall(type(uint256).max / 2);
+        treasury.setMaxWethConvertPerCall(type(uint256).max / 2);
         treasury.setKeeper(address(this), true);
 
         // ── the "tax": fund the Treasury with WETH (a real sell would deliver this via the hook) ──

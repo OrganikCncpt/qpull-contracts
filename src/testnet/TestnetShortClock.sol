@@ -105,6 +105,12 @@ contract RaffleEngineTestnet is RaffleEngine {
     ) RaffleEngine(drand_, packs_, vault_, claim_, genesis_, k_, minPot_, potCap_, initialOwner) {}
 
     function DAY() internal pure override returns (uint256) { return 5 minutes; }
+    /// @dev THE REVEAL_LAG OVERRIDE IS A BUG FIX, NOT A CONVENIENCE (same defect as HolderDrawEngine above).
+    ///      drawRound(d) is drand.roundAt(genesis + (d+1)*DAY() + REVEAL_LAG()), while runDraw only accepts
+    ///      currentDay() == d + 1, a window one DAY() wide. With DAY() at 5 minutes and the mainnet 1-hour lag,
+    ///      the settling round sat ~55 minutes PAST the end of the window that needs it, so a real-oracle
+    ///      testnet draw could never settle. Must stay well under DAY().
+    function REVEAL_LAG() internal pure override returns (uint256) { return 1 minutes; }
 }
 
 /// @dev Raffle-ticket registry: 1-day cadence -> 5 minutes. MUST match RaffleEngineTestnet.DAY().

@@ -131,8 +131,9 @@ contract FullSystemTest is Test {
         treasury.setRouting(address(prizeVault), address(holderVault), address(leaderboardVault), team);
         treasury.setConvertThreshold(0);
         // The per-call caps ship fail-CLOSED (0 = NotConfigured, pre-audit medium); arm them (go-live step 1).
-        treasury.setMaxConvertPerCall(type(uint256).max);
-        treasury.setMaxWethConvertPerCall(type(uint256).max);
+        // external audit F-5: max is now rejected on-chain; a large finite value keeps "uncapped" intent.
+        treasury.setMaxConvertPerCall(type(uint256).max / 2);
+        treasury.setMaxWethConvertPerCall(type(uint256).max / 2);
         treasury.setKeeper(address(this), true); // convert() is keeper-gated (audit fix)
     }
 

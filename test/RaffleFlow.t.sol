@@ -585,6 +585,28 @@ contract RaffleFlowTest is Test {
         assertEq(r5.currentDay(), 1, "engine counts 5-minute days");
         assertEq(p5.today(), 1, "registry counts the same 5-minute days");
     }
+
+    /// @notice A shortened-cadence subclass must shorten REVEAL_LAG() too, or its settling beacon binds
+    ///         AFTER the draw window that needs it has already closed and runDraw can never settle.
+    ///         REVEAL_LAG used to be a plain `constant`, so RaffleEngineTestnet shortened DAY() to 5 minutes
+    ///         while the beacon stayed 1 hour out: the window closed ~55 minutes before its round existed.
+    ///         It was invisible on testnet only because MOCK_ORACLE serves a settable beacon. Now virtual.
+    function test_cadence_revealLagMustFitInsideTheDrawWindow() public {
+        PackRegistryFiveMin p5 = new PackRegistryFiveMin(address(oracle), TICKET, GENESIS, 1 hours, address(this));
+        RaffleEngineFiveMin r5 = new RaffleEngineFiveMin(
+            address(oracle), address(p5), address(vault), address(claimMgr), GENESIS, K, 1, POT, address(this)
+        );
+        // the settling beacon must publish strictly inside the [day+1, day+2) window that runDraw accepts
+        assertLt(r5.revealLag_(), r5.day_(), "REVEAL_LAG must fit inside one DAY(), else the draw can never settle");
+
+        // and concretely: the round settling day D binds before that window closes
+        uint32 D = 3;
+        uint256 windowOpens = GENESIS + (uint256(D) + 1) * r5.day_();
+        uint256 windowCloses = windowOpens + r5.day_();
+        uint256 beaconAt = windowOpens + r5.revealLag_();
+        assertGe(beaconAt, windowOpens, "beacon must not predate the window (else it is grindable)");
+        assertLt(beaconAt, windowCloses, "beacon must land before the window closes");
+    }
 }
 
 // ─── pre-audit (cadence cross-check) fixtures: short-clock halves of the RaffleEngine/PackRegistry pair ────
@@ -616,4 +638,15 @@ contract RaffleEngineFiveMin is RaffleEngine {
     function DAY() internal pure override returns (uint256) {
         return 5 minutes;
     }
+
+    /// @dev Mirrors the RaffleEngineTestnet fix: a subclass that shortens DAY() MUST also shorten
+    ///      REVEAL_LAG(), or drawRound() binds the settling beacon past the end of the one-DAY()-wide
+    ///      draw window and runDraw can never find it. Kept in lockstep with src/testnet/TestnetShortClock.sol.
+    function REVEAL_LAG() internal pure override returns (uint256) {
+        return 1 minutes;
+    }
+
+    // expose the cadence knobs so the invariant below can be asserted directly
+    function day_() external view returns (uint256) { return DAY(); }
+    function revealLag_() external view returns (uint256) { return REVEAL_LAG(); }
 }

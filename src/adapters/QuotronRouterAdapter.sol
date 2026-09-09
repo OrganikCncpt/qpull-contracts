@@ -43,6 +43,9 @@ contract QuotronRouterAdapter is ISwapAdapter, Ownable2Step, ReentrancyGuard {
     constructor(address router_, address weth_, address quotron_, address initialOwner)
         Ownable(initialOwner)
     {
+        // Slither `missing-zero-check`, the variant of external audit Treasury F-9 in a contract no external
+        // engagement ever had in scope. These bindings are immutable with no re-deploy path.
+        if (router_ == address(0) || weth_ == address(0) || quotron_ == address(0)) revert ZeroAddress();
         router = IQuotronRouter(router_);
         weth = weth_;
         quotron = quotron_;

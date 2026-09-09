@@ -81,6 +81,10 @@ contract Treasury is NonRenounceableOwnable2Step, ReentrancyGuard, IERC721Receiv
     error NotKeeper();
     error SwapShortfall();
     error RoutingAlreadyLocked(); // audit F2 (pass-5)
+    error VaultsNotDistinct(); // external audit F-1: aliased vaults double-count in owedTotal
+    error OwedBeforeReroute(); // external audit F-1: a reroute would orphan the outgoing vault's owed slice
+    error CapTooLarge(); // external audit F-5: the go-live script's != max assertion, moved on-chain
+    error UnexpectedNft(); // pre-submission N-4 variant: only QUOTRON's own auto-mint may push a 721 here
 
     modifier onlyKeeper() {
         if (!isKeeper[msg.sender]) revert NotKeeper();
@@ -88,6 +92,11 @@ contract Treasury is NonRenounceableOwnable2Step, ReentrancyGuard, IERC721Receiv
     }
 
     constructor(address qpull_, address weth_, address quotron_, address initialOwner) Ownable(initialOwner) {
+        // external audit F-9: these three bindings are immutable with no re-deploy path, so a zero address
+        // here is permanent and bricks convert() unconditionally — balanceOf on a codeless address returns
+        // EMPTY returndata and the decoder rejects it (the extcodesize check is skipped when return data is
+        // expected). Fail at construction rather than at the first convert().
+        if (qpull_ == address(0) || weth_ == address(0) || quotron_ == address(0)) revert NotConfigured();
         qpull = IERC20(qpull_);
         weth = IERC20(weth_);
         quotron = IERC20(quotron_);
@@ -122,6 +131,21 @@ contract Treasury is NonRenounceableOwnable2Step, ReentrancyGuard, IERC721Receiv
         ) {
             revert NotConfigured(); // audit M-1: no zero routing destinations
         }
+        // external audit F-1 (a): convert() computes owedTotal by summing quotronOwed at the three CURRENT
+        // role addresses. If two roles share an address that sum double-counts it, permanently under-computing
+        // `splittable` for every later convert(). Nothing else in the file rejects aliasing. `team` is exempt:
+        // it takes WETH, never QUOTRON, and is not part of owedTotal.
+        if (prize_ == holder_ || holder_ == leaderboard_ || prize_ == leaderboard_) revert VaultsNotDistinct();
+        // external audit F-1 (b): quotronOwed is keyed by raw address. Rerouting a role away from a vault that
+        // still holds an owed slice makes that slice invisible to owedTotal forever — it is folded into the
+        // next `splittable` and paid to whichever vaults are current, which is exactly the silent
+        // redistribution the M-2 retry mechanism exists to prevent. The launch order (Deploy wires routing,
+        // GoLive arms the caps then locks) means this is unreachable today; this makes it unreachable by
+        // CONSTRUCTION rather than by procedure.
+        if (
+            quotronOwed[prizeVault] != 0 || quotronOwed[holderVault] != 0
+                || quotronOwed[leaderboardVault] != 0
+        ) revert OwedBeforeReroute();
         prizeVault = prize_;
         holderVault = holder_;
         leaderboardVault = leaderboard_;
@@ -140,6 +164,11 @@ contract Treasury is NonRenounceableOwnable2Step, ReentrancyGuard, IERC721Receiv
             address(qpullWeth) == address(0) || address(wethQuotron) == address(0) || prizeVault == address(0)
                 || holderVault == address(0) || leaderboardVault == address(0) || team == address(0)
         ) revert NotConfigured();
+        // external audit F-8: convert() ALSO requires both caps (see its own NotConfigured check), so a lock
+        // that verifies only the six addresses promises a completeness it does not check. Callers must arm the
+        // caps first. NOTE: this reorders script/DeployTestnet.s.sol, which used to lock in-deploy and leave
+        // the caps to GoLiveTestnet; it now arms them immediately before the lock, matching GoLiveMainnet.
+        if (maxConvertPerCall == 0 || maxWethConvertPerCall == 0) revert NotConfigured();
         routingLocked = true;
         emit RoutingLocked();
     }
@@ -156,6 +185,7 @@ contract Treasury is NonRenounceableOwnable2Step, ReentrancyGuard, IERC721Receiv
     ///         inflated balance in pool-sized slices instead of bricking on a single oversized swap.
     function setMaxConvertPerCall(uint256 m) external onlyOwner {
         if (m == 0) revert BelowThreshold();
+        if (m == type(uint256).max) revert CapTooLarge(); // external audit F-5, see setMaxWethConvertPerCall
         maxConvertPerCall = m;
         emit MaxConvertPerCallSet(m);
     }
@@ -164,7 +194,16 @@ contract Treasury is NonRenounceableOwnable2Step, ReentrancyGuard, IERC721Receiv
     ///         the WETH→QUOTRON leg, so a WETH donation can't force an oversized single swap that bricks the
     ///         whole pipeline. The keeper drains the excess in pool-sized slices.
     function setMaxWethConvertPerCall(uint256 m) external onlyOwner {
+        // external audit F-5: SECURITY.md 16.6 claimed these caps "are not a rug lever" because they cannot
+        // redirect funds or change the split. True, and beside the point — value leaves through swap SLIPPAGE
+        // without any destination changing. setKeeper is likewise never lock-gated (deliberately, a rotatable
+        // hot key), so post-lock a compromised owner could set this to max, self-grant keeper, and call
+        // convert(0,0) to sandwich an uncapped slice through the shallow QUOTRON pool. The != max bound that
+        // was supposed to prevent that lived in script/GoLiveMainnet.s.sol, which has ALREADY RUN by then.
+        // Moving it on-chain makes it survive the script. Ordinary re-tuning (caps must track pool depth as
+        // the locked LP accrues fees) is unaffected: only the literal max is refused.
         if (m == 0) revert BelowThreshold();
+        if (m == type(uint256).max) revert CapTooLarge();
         maxWethConvertPerCall = m;
         emit MaxWethConvertPerCallSet(m);
     }
@@ -229,12 +268,20 @@ contract Treasury is NonRenounceableOwnable2Step, ReentrancyGuard, IERC721Receiv
         if (teamWeth > 0) weth.safeTransfer(team, teamWeth); // audit job-745 info: zero-guard like the QUOTRON legs
         uint256 prizeWeth = wethOut - teamWeth;
 
-        // 3. prize WETH -> QUOTRON — measured delta again (audit H-14)
-        uint256 qBefore = quotron.balanceOf(address(this));
-        weth.forceApprove(address(wethQuotron), prizeWeth);
-        wethQuotron.swapExactIn(address(weth), address(quotron), prizeWeth, minQuotronOut, address(this));
-        weth.forceApprove(address(wethQuotron), 0); // audit L-10: leave no residual allowance
-        uint256 qOut = quotron.balanceOf(address(this)) - qBefore; // THIS-swap delta — the floor check keys on it
+        // 3. prize WETH -> QUOTRON — measured delta again (audit H-14). external audit F-10: skip the swap
+        //    entirely on a zero slice, mirroring the zero-guards the team leg (L229) and the vault sends
+        //    (_trySendQuotron) already have. prizeWeth reaches 0 only when leg 1 produced no WETH against a
+        //    keeper-supplied minWethOut of 0, but whether the adapter tolerates amountIn == 0 is an
+        //    out-of-scope property we should not depend on. The shortfall check stays OUTSIDE the guard so a
+        //    keeper that asked for output it cannot get still reverts rather than silently succeeding.
+        uint256 qOut;
+        if (prizeWeth > 0) {
+            uint256 qBefore = quotron.balanceOf(address(this));
+            weth.forceApprove(address(wethQuotron), prizeWeth);
+            wethQuotron.swapExactIn(address(weth), address(quotron), prizeWeth, minQuotronOut, address(this));
+            weth.forceApprove(address(wethQuotron), 0); // audit L-10: leave no residual allowance
+            qOut = quotron.balanceOf(address(this)) - qBefore; // THIS-swap delta — the floor check keys on it
+        }
         if (qOut < minQuotronOut) revert SwapShortfall();
 
         // 4. Split the NEWLY-CONVERTED QUOTRON across the prize vaults (of the 8000 prize bps). The three sends
@@ -274,8 +321,37 @@ contract Treasury is NonRenounceableOwnable2Step, ReentrancyGuard, IERC721Receiv
         // RETURNING false rather than reverting — in which case the low-level call still reports ok==true.
         // Decode and require the boolean (SafeERC20 discipline) so a non-reverting false re-owes to THIS
         // vault instead of silently leaving the tokens un-owed for the next convert() to re-split to siblings.
-        (bool ok, bytes memory ret) = address(quotron).call(abi.encodeCall(IERC20.transfer, (to, total)));
-        bool success = ok && (ret.length == 0 || abi.decode(ret, (bool)));
+        // external audit F-2 + F-7, fixed together because they share one line. The previous form was
+        //   (bool ok, bytes memory ret) = ...call(...);  bool success = ok && (ret.length == 0 || abi.decode(ret,(bool)));
+        // which had two defects, both defeating the per-vault isolation this helper exists to provide:
+        //   F-2: abi.decode REVERTS on return data that is neither empty nor a well-formed 32-byte bool.
+        //        Measured, not assumed: a 1..31-byte buffer reverts on out-of-bounds decoding and a 32-byte
+        //        non-boolean panics. That revert propagates out of the nonReentrant convert() and unwinds the
+        //        whole batch — the entire failure mode M-1/M-2 were written to eliminate, reached by a third
+        //        shape. (0, 32-byte bool and 64-byte-with-leading-bool all behaved correctly and still do.)
+        //   F-7: capturing `bytes memory ret` copies the ENTIRE return buffer, so a callee returning a huge
+        //        payload forces quadratic memory expansion on the caller — a return-data bomb.
+        // Reading returndatasize() and copying at most one word closes both: it never reverts on a malformed
+        // reply (the slice is simply re-owed and retried next convert) and never copies more than 32 bytes.
+        (bool ok,) = address(quotron).call(abi.encodeCall(IERC20.transfer, (to, total)));
+        bool success;
+        if (ok) {
+            uint256 rds;
+            assembly ("memory-safe") {
+                rds := returndatasize()
+            }
+            if (rds == 0) {
+                success = true; // a non-standard token that returns nothing on success
+            } else if (rds >= 32) {
+                uint256 word;
+                assembly ("memory-safe") {
+                    returndatacopy(0x00, 0x00, 32) // scratch space; never more than one word
+                    word := mload(0x00)
+                }
+                success = (word == 1); // anything else (incl. a 32-byte non-boolean) counts as failure
+            }
+            // 1..31 bytes: malformed. Leave success false so the slice is re-owed, and do NOT revert.
+        }
         if (!success) quotronOwed[to] = total; // still blocked: owe the full slice to THIS vault, retry next convert
     }
 
@@ -284,12 +360,20 @@ contract Treasury is NonRenounceableOwnable2Step, ReentrancyGuard, IERC721Receiv
     ///         shows real QUOTRON does NOT fire a receiver callback on a plain contract (it appears to
     ///         auto-exempt contracts from the NFT side), so convert() is safe without this. We implement
     ///         it anyway — zero cost, uniform with the vaults, and a hedge if that exemption ever changes.
+    /// @dev VARIANT of pre-submission review N-4 (found on BaseVault, swept here). This hook was
+    ///      unconditional, and Treasury has NO ERC-721 egress either — no transferFrom, no rescue, no
+    ///      sweep — so any 721 sent here was destroyed. The Treasury address is published deploy output,
+    ///      making a misdirected safeTransferFrom a realistic accident rather than an attack. Gating on
+    ///      msg.sender keeps the entire documented §13.3 purpose (QUOTRON's ERC-404 auto-mint always calls
+    ///      with msg.sender == quotron) and restores the revert ERC-721's _checkOnERC721Received would
+    ///      otherwise have given the sender.
     function onERC721Received(address, address, uint256, bytes calldata)
         external
-        pure
+        view
         override
         returns (bytes4)
     {
+        if (msg.sender != address(quotron)) revert UnexpectedNft();
         return IERC721Receiver.onERC721Received.selector;
     }
 }

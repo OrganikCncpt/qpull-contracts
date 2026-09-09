@@ -1273,28 +1273,31 @@ contract NFTCollectionTest is Test {
         vm.warp(b + STEP); // exactly due
         vm.prank(stranger);
         n.advanceRevealFallback();
-        assertEq(n.revealRound(), oracle.roundAt(b + STEP), "bound to the rung-1 round at the exact instant");
+        // external audit F-1: the binding is now roundAt(now + revealDelay), a FUTURE round, not
+        // roundAt(b + STEP) — that instant has already passed, so its beacon would already be public.
+        assertEq(n.revealRound(), oracle.roundAt(block.timestamp + n.revealDelay()), "bound to a FUTURE round");
         assertEq(n.revealFallbackRung(), 1);
     }
 
-    /// (c) Past the rung instant with the round still unavailable, ANYONE advances to the PREDETERMINED
-    /// round drand.roundAt(revealBoundAt + STEP), the event fires, and rarity then resolves from that round.
-    function test_revealFallback_anyoneAdvancesToPredeterminedRound() public {
+    /// (c) Past the rung instant with the round still unavailable, ANYONE advances. CORRECTED for external
+    /// audit F-1: the new binding is a FUTURE round (roundAt(now + revealDelay)), not the round at the rung
+    /// instant. Rarity then resolves from it once its beacon lands.
+    function test_revealFallback_anyoneAdvancesToAFutureRound() public {
         NFTCollection n = _finalized();
         uint256 b = n.revealBoundAt();
         uint64 r0 = n.revealRound();
-        uint64 expected = oracle.roundAt(b + STEP);
-        assertTrue(expected != r0, "the fallback round differs from the never-produced one");
 
-        vm.warp(b + STEP + 3 hours); // an arbitrary instant inside the rung-1 window
+        vm.warp(b + STEP + 3 hours); // an arbitrary instant past rung 1
+        uint64 expected = oracle.roundAt(block.timestamp + n.revealDelay());
+        assertTrue(expected != r0, "the fallback round differs from the never-produced one");
         assertFalse(oracle.isAvailable(r0), "r0 never produced");
         address stranger = makeAddr("stranger");
         vm.expectEmit(true, false, false, true, address(n));
-        emit RevealFallbackAdvanced(1, r0, expected, b + STEP);
+        emit RevealFallbackAdvanced(1, r0, expected, block.timestamp);
         vm.prank(stranger);
         n.advanceRevealFallback();
 
-        assertEq(n.revealRound(), expected, "bound to the time-predetermined round");
+        assertEq(n.revealRound(), expected, "bound to a future round");
         assertEq(n.revealFallbackRung(), 1, "rung 1 taken");
         assertFalse(n.isRevealed(), "still sealed until the NEW round's beacon lands");
         vm.expectRevert(); // rarity now keys off the new round, which is not posted yet
@@ -1313,11 +1316,13 @@ contract NFTCollectionTest is Test {
         assertEq(n.revealRound(), expected, "never re-rolled after resolution");
     }
 
-    /// TIME-DETERMINISM (no grinding): two callers at different instants inside the same rung window bind the
-    /// SAME round; the call's timing selects nothing.
-    function test_revealFallback_sameRungSameRoundRegardlessOfCallTime() public {
-        // two collections started in the SAME block (no per-collection warp), so one warp puts both in PUBLIC
-        // and both finalize in the same block: identical revealBoundAt and revealRound.
+    /// INVERTED BY external audit F-1 (2026-09-08). This test was called "TIME-DETERMINISM (no grinding)"
+    /// and asserted that two callers at different instants bind the SAME round. That determinism WAS the
+    /// grinding surface: the round it pinned was `roundAt(revealBoundAt + k*STEP)`, an instant already in
+    /// the past, so its beacon was public and a caller could choose which rung to stop on. The property we
+    /// actually need is the opposite: every binding is a round in the FUTURE, hence unknowable, so the
+    /// call's timing selects nothing of VALUE even though it does select a different round.
+    function test_f1_differentCallTimesBindDifferentButAlwaysFutureRounds() public {
         NFTCollection a = _allowlistPhaseCollection();
         NFTCollection b = _allowlistPhaseCollection();
         vm.warp(a.publicOpensAt());
@@ -1329,59 +1334,96 @@ contract NFTCollectionTest is Test {
         assertEq(a.revealRound(), b.revealRound(), "same rung-0 round");
         uint256 bound = a.revealBoundAt();
 
-        vm.warp(bound + STEP); // first instant of the rung-1 window
+        // NOTE ON TEST AUTHORING (via_ir hazard, found writing this test): do NOT capture block.timestamp
+        // into a local, then vm.warp, then use the local. Under via_ir the optimizer treats block.timestamp
+        // as invariant within a call and REMATERIALIZES it at the use site, so the local silently tracks the
+        // warped time. Proven here: a captured copy printed 1777600 immediately and 2382399 after a warp,
+        // with no reassignment. Assert against block.timestamp at the instant it matters instead.
+        vm.warp(bound + STEP); // first instant rung 1 is due
         vm.prank(makeAddr("early"));
         a.advanceRevealFallback();
-        vm.warp(bound + 2 * STEP - 1); // last instant of the rung-1 window
+        uint64 aRound = a.revealRound();
+        assertGt(_roundPublishTime(aRound), block.timestamp, "early call bound an UNPUBLISHED round");
+
+        vm.warp(bound + 2 * STEP - 1); // much later
         vm.prank(makeAddr("late"));
         b.advanceRevealFallback();
+        uint64 bRound = b.revealRound();
+        assertGt(_roundPublishTime(bRound), block.timestamp, "late call bound an UNPUBLISHED round");
 
-        assertEq(a.revealRound(), b.revealRound(), "same rung => same round, whenever it is called");
-        assertEq(a.revealRound(), oracle.roundAt(bound + STEP), "the rung-1 round is fixed by the anchor");
-        assertTrue(b.revealRound() != oracle.roundAt(block.timestamp), "the late call's own time is irrelevant");
+        // different call times bind DIFFERENT rounds now, and that is correct: every candidate is equally
+        // unknowable, so timing selects nothing of VALUE.
+        assertTrue(aRound != bRound, "the call instant selects a different round -- by design after F-1");
     }
 
-    /// Rungs are walked in order and can never be skipped; once a rung's round is available the ladder stops
-    /// and rarity resolves from THAT round.
-    function test_revealFallback_walksSuccessiveRungsWithoutSkipping() public {
+    /// @dev In MockDrandOracle, roundAt(ts) is a CEIL, so round r first publishes at gen + (r-1)*per.
+    function _roundPublishTime(uint64 r) internal view returns (uint256) {
+        return oracle.gen() + (uint256(r) - 1) * oracle.per();
+    }
+
+    /// THE F-1 REGRESSION GATE. Pre-fix this fails outright: the ladder bound roundAt(rungTime) where
+    /// rungTime <= block.timestamp by the gate immediately above it, so the round was ALREADY PUBLISHED
+    /// and its beacon readable in drand's archive at the moment it became the seal for all 3,500 rarities.
+    function test_f1_fallbackNeverBindsAnAlreadyPublishedRound() public {
+        NFTCollection n = _finalized();
+        uint256 b = n.revealBoundAt();
+        // walk several rungs, each one late, and check EVERY binding is still in the future
+        for (uint256 k = 1; k <= 3; ++k) {
+            vm.warp(b + k * STEP + 5 days); // deliberately long past the rung instant
+            vm.prank(makeAddr("stranger"));
+            n.advanceRevealFallback();
+            assertGt(
+                _roundPublishTime(n.revealRound()),
+                block.timestamp,
+                "a fallback binding must never be a round whose beacon is already public"
+            );
+            b = n.revealBoundAt(); // re-anchored to this advance
+        }
+    }
+
+    /// INVERTED BY external audit F-1. This asserted "the next call walks to rung 2 (same block is fine)".
+    /// Same-block walking IS the grinding mechanism: with several rungs due, a caller stepped through them,
+    /// read each already-published candidate beacon, stopped on the best rarity map, and welded it in via
+    /// the permissionless submitBeacon in the same transaction. Re-anchoring revealBoundAt on every advance
+    /// makes exactly one advance possible per REVEAL_FALLBACK_STEP, however late the call.
+    function test_f1_cannotWalkMultipleRungsInOneBlock() public {
         NFTCollection n = _finalized();
         uint256 b = n.revealBoundAt();
         uint64 r0 = n.revealRound();
         address stranger = makeAddr("stranger");
 
-        // jump straight past rung 2's instant: the FIRST advance still binds rung 1, not rung 2
-        vm.warp(b + 2 * STEP + 1);
+        vm.warp(b + 3 * STEP + 1); // three rungs "due" by elapsed time
         vm.prank(stranger);
         n.advanceRevealFallback();
-        assertEq(n.revealRound(), oracle.roundAt(b + STEP), "rung 1 first, even when rung 2 is also due");
-        assertEq(n.revealFallbackRung(), 1);
-        // rung 1 still unavailable and rung 2 is due: the next call walks to rung 2 (same block is fine)
-        vm.prank(stranger);
-        n.advanceRevealFallback();
-        assertEq(n.revealRound(), oracle.roundAt(b + 2 * STEP), "rung 2");
-        assertEq(n.revealFallbackRung(), 2);
-        // rung 3 is not due yet
+        uint64 first = n.revealRound();
+        assertEq(n.revealFallbackRung(), 1, "one advance only, however many rungs elapsed");
+        assertEq(n.revealBoundAt(), block.timestamp, "anchor moved to this advance");
+
+        // the second call in the SAME block must now revert -- this is the grinding surface, closed
         vm.prank(stranger);
         vm.expectRevert(NFTCollection.RevealFallbackNotDue.selector);
         n.advanceRevealFallback();
-        vm.warp(b + 3 * STEP);
+        assertEq(n.revealRound(), first, "round unchanged by the refused walk");
+
+        // and a full step later exactly one further advance is possible
+        vm.warp(block.timestamp + STEP);
         vm.prank(stranger);
         n.advanceRevealFallback();
-        uint64 r3 = n.revealRound();
-        assertEq(r3, oracle.roundAt(b + 3 * STEP), "rung 3");
-        assertEq(n.revealFallbackRung(), 3);
-        assertTrue(r3 != r0);
+        assertEq(n.revealFallbackRung(), 2);
+        vm.prank(stranger);
+        vm.expectRevert(NFTCollection.RevealFallbackNotDue.selector);
+        n.advanceRevealFallback();
 
-        // rung 3's beacon lands: resolved from it, and the ladder is closed for good
-        bytes32 beacon = keccak256("r3");
-        oracle.setBeacon(r3, beacon);
-        assertEq(n.rarityOf(1), _tierFor(beacon, 1), "rarity resolves from the rung-3 round");
-        vm.warp(b + 10 * STEP);
+        uint64 r2 = n.revealRound();
+        assertTrue(r2 != r0);
+        // the beacon lands: resolved, ladder closed for good
+        bytes32 beacon = keccak256("r2");
+        oracle.setBeacon(r2, beacon);
+        assertEq(n.rarityOf(1), _tierFor(beacon, 1), "rarity resolves from the current round");
+        vm.warp(block.timestamp + 10 * STEP);
         vm.prank(stranger);
         vm.expectRevert(NFTCollection.RevealAlreadyResolved.selector);
         n.advanceRevealFallback();
-        assertEq(n.revealRound(), r3);
-        assertEq(n.revealFallbackRung(), 3);
     }
 
     /// No stale binding: after a re-bind, a LATE beacon for the old round changes nothing; rarity keys off

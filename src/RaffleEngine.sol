@@ -45,7 +45,14 @@ contract RaffleEngine is NonRenounceableOwnable2Step, ReentrancyGuard {
     // daily pot is small and split across tier buckets among K winners (far lower value than the winner-
     // take-all jackpot), and the attack requires the RH-operated sequencer to catastrophically mis-stamp
     // time — which would break the whole chain, not just this raffle. See SECURITY.md §10 (M-7).
-    uint256 internal constant REVEAL_LAG = 1 hours;
+    // `virtual` so a TESTNET-ONLY subclass can shorten it alongside DAY(). ANY SUBCLASS THAT SHORTENS DAY()
+    // MUST ALSO SHORTEN THIS, or drawRound() binds the settling beacon further out than the draw window
+    // (`currentDay() == day + 1`, one DAY() wide) ever reaches, and runDraw can never find its beacon. That is
+    // exactly the defect TestnetShortClock documents for HolderDrawEngine.REVEAL_LAG; this one was a plain
+    // `constant`, so RaffleEngineTestnet shortened DAY() to 5 minutes while the beacon stayed 1 hour out --
+    // the 5-minute window closed ~55 minutes before its round existed. Masked on testnet only because
+    // MOCK_ORACLE serves a settable beacon; it would have bricked every real-oracle testnet raffle draw.
+    function REVEAL_LAG() internal view virtual returns (uint256) { return 1 hours; }
     uint256 public constant MAX_K = 200; // audit M-3: one-block-safe (was 1000; ~120-140k gas/winner)
     uint256 internal constant BPS = 10_000;
     uint256 internal constant MAX_ADJ_BPS = 2500; // audit M4 (job-745): potCap re-peg bounded to +/-25%/cooldown
@@ -136,7 +143,10 @@ contract RaffleEngine is NonRenounceableOwnable2Step, ReentrancyGuard {
         // re-target who wins. Now K moves at most ~25%/draw-day (a day-open snapshot would be stronger, but
         // this matches the sibling knobs). audit M-7: band never collapses to a point.
         if (block.timestamp < uint256(lastWinnersAdjust) + DAY()) revert AdjustTooSoon();
-        uint256 lo = (winnersPerDay * (BPS - MAX_ADJ_BPS)) / BPS;
+        // external audit F-11: `hi` had a collapse guard but `lo` did not, and flooring `lo` widens the band
+        // far past the documented +/-25% at small values — at winnersPerDay = 1 the reachable band was [1,2],
+        // a 100% step. Ceil `lo` so the floor is symmetric with the existing `hi` guard.
+        uint256 lo = ((winnersPerDay * (BPS - MAX_ADJ_BPS)) + BPS - 1) / BPS;
         uint256 hi = (winnersPerDay * (BPS + MAX_ADJ_BPS)) / BPS;
         if (hi <= winnersPerDay) hi = winnersPerDay + 1;
         if (k < lo || k > hi) revert AdjustOutOfBounds();
@@ -153,7 +163,7 @@ contract RaffleEngine is NonRenounceableOwnable2Step, ReentrancyGuard {
         // reactively jump minPot up to potCap after a beacon reveals to force every draw into the void branch.
         // audit M-7 (pass-8): floor hi at minPot+1 so the band never collapses to a point (minPot <= 3).
         if (block.timestamp < uint256(lastMinPotAdjust) + DAY()) revert AdjustTooSoon();
-        uint256 lo = (minPot * (BPS - MAX_ADJ_BPS)) / BPS;
+        uint256 lo = ((minPot * (BPS - MAX_ADJ_BPS)) + BPS - 1) / BPS; // external audit F-11: ceil, see setWinnersPerDay
         uint256 hi = (minPot * (BPS + MAX_ADJ_BPS)) / BPS;
         if (hi <= minPot) hi = minPot + 1;
         if (m < lo || m > hi) revert AdjustOutOfBounds();
@@ -169,7 +179,7 @@ contract RaffleEngine is NonRenounceableOwnable2Step, ReentrancyGuard {
     function setPotCap(uint256 c) external onlyOwner {
         if (c == 0 || c < minPot) revert BadPotCap(); // audit L-3: never below the minPot floor (checked first)
         if (block.timestamp < uint256(lastPotAdjust) + DAY()) revert AdjustTooSoon();
-        uint256 lo = (potCap * (BPS - MAX_ADJ_BPS)) / BPS;
+        uint256 lo = ((potCap * (BPS - MAX_ADJ_BPS)) + BPS - 1) / BPS; // external audit F-11: ceil, see setWinnersPerDay
         uint256 hi = (potCap * (BPS + MAX_ADJ_BPS)) / BPS;
         if (hi <= potCap) hi = potCap + 1; // audit M-7 (pass-8): band never collapses to a point
         if (c < lo || c > hi) revert AdjustOutOfBounds();
@@ -181,7 +191,7 @@ contract RaffleEngine is NonRenounceableOwnable2Step, ReentrancyGuard {
     /// @notice The drand round whose beacon settles day `day` — publishes REVEAL_LAG after day+1 opens,
     ///         so it is unknowable while any in-window ticket is still being bought.
     function drawRound(uint32 day) public view returns (uint64) {
-        return drand.roundAt(genesis + (uint256(day) + 1) * DAY() + REVEAL_LAG);
+        return drand.roundAt(genesis + (uint256(day) + 1) * DAY() + REVEAL_LAG());
     }
 
     function currentDay() public view returns (uint32) {
@@ -306,6 +316,12 @@ contract RaffleEngine is NonRenounceableOwnable2Step, ReentrancyGuard {
             uint256 prize = (pot * bucketBps(t)) / (BPS * counts[t]);
             if (prize == 0) continue;
             address owner = packs.ownerOf(winners[i]);
+            // external audit F-13: ClaimManager.registerClaim reverts ZeroRecipient on a zero address, and
+            // _payWinners has NO fault isolation, so one such winner would revert the entire day's draw for
+            // everyone. This is the only reachable trigger for that finding (F-1) — their per-recipient-cap
+            // mechanism does not exist in our ClaimManager. Skip the seat instead; its share rolls forward,
+            // matching the empty-bucket behaviour the tier split already has.
+            if (owner == address(0)) continue;
             uint256 claimId = claimManager.registerClaim(address(vault), owner, prize, deadline);
             emit WinnerPaid(day, winners[i], owner, t, prize, claimId); // per-win record for the draw log
         }

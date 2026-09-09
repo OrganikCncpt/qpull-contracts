@@ -222,8 +222,9 @@ contract InvariantTreasurySplitTest is Test {
         treasury.setConvertThreshold(0);
         // The per-call caps ship fail-CLOSED (0 = NotConfigured, pre-audit medium): arm them wide open here
         // as the launch posture; the handler's setCaps re-tunes them to pool-sized values mid-campaign.
-        treasury.setMaxConvertPerCall(type(uint256).max);
-        treasury.setMaxWethConvertPerCall(type(uint256).max);
+        // external audit F-5: max is now rejected on-chain; a large finite value keeps "uncapped" intent.
+        treasury.setMaxConvertPerCall(type(uint256).max / 2);
+        treasury.setMaxWethConvertPerCall(type(uint256).max / 2);
         treasury.lockRouting(); // audit F2/L3 (pass-5, job-745): launch posture, destinations final
 
         address[3] memory vaults = [prizeVault, holderVault, leaderboardVault];

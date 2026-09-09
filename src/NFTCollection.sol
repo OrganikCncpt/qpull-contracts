@@ -203,7 +203,8 @@ contract NFTCollection is INFTCollection, ERC721, NonRenounceableOwnable2Step, R
     event ReserveMinted(address indexed to, uint256 qty); // pass-13: owner treasury reserve (ids 1..qty)
     /// @notice preaudit: the reveal fallback re-bound the collection from `fromRound` (never produced) to
     ///         `toRound` = drand.roundAt(`rungTime`), the round predetermined for `rung`.
-    event RevealFallbackAdvanced(uint256 indexed rung, uint64 fromRound, uint64 toRound, uint256 rungTime);
+    /// @param boundAt the instant this advance happened; the next rung is REVEAL_FALLBACK_STEP() after it
+    event RevealFallbackAdvanced(uint256 indexed rung, uint64 fromRound, uint64 toRound, uint256 boundAt);
 
     error MintClosed();
     error SoldOut();
@@ -268,7 +269,10 @@ contract NFTCollection is INFTCollection, ERC721, NonRenounceableOwnable2Step, R
     }
 
     function setRecipients(address lp, address seed, address team_) external onlyOwner {
-        if (totalMinted > 0) revert AlreadyMinting(); // audit H-12: destinations freeze before any ETH flows
+        // external audit F-3: this guarded only `totalMinted > 0`, while setAllowlistRoot guards
+        // `mintStart != 0` and this function's own NatSpec says destinations freeze BEFORE the mint starts.
+        // Between openAllowlistMint() and the first mint the owner could still re-point all three.
+        if (mintStart != 0 || totalMinted > 0) revert AlreadyMinting(); // audit H-12 + external audit F-3
         if (lp == address(0) || seed == address(0) || team_ == address(0)) revert RecipientsUnset();
         // audit M-15 (pass-8): the three destinations must be distinct, so the 80/10/10 split can't be collapsed
         // into 100% to one owner-chosen address. (Verifying lp/seed are the locked treasuries is a runbook step.)
@@ -362,6 +366,11 @@ contract NFTCollection is INFTCollection, ERC721, NonRenounceableOwnable2Step, R
     function openAllowlistMint() external onlyOwner {
         if (launched) revert AlreadyLaunched();
         if (mintStart != 0) revert AlreadyStarted(); // one-shot: the mint starts exactly once
+        // external audit F-5: once the launch backstop has expired, finalizeLaunch()'s PERMISSIONLESS branch
+        // is armed, so the owner's openAllowlistMint() and any stranger's finalizeLaunch() are simultaneously
+        // callable and mutually exclusive — and `launched` is one-shot, so whoever lands first wins. Refuse to
+        // start a mint that a race could cancel; the backstop exists precisely to end the waiting.
+        if (launchBackstopExpired()) revert AlreadyStarted();
         if (allowlistRoot == bytes32(0)) revert AllowlistRootUnset(); // else the GTD window admits nobody
         if (!mintOpen) revert MintClosed(); // never start the timed windows against a paused mint
         _requireRecipientsSet();
@@ -630,12 +639,16 @@ contract NFTCollection is INFTCollection, ERC721, NonRenounceableOwnable2Step, R
     ///         rung k is `drand.roundAt(revealBoundAt + k * REVEAL_FALLBACK_STEP())`, callable only once that
     ///         instant has passed AND the currently bound round is still unavailable. Nobody chooses a round
     ///         (no owner, no keeper, no caller): the round is pure time math off the one-shot `revealBoundAt`,
-    ///         and the call's own timing selects nothing, so two callers anywhere inside the same rung window
-    ///         bind the SAME round. Repeated calls walk successive rungs while rounds stay unavailable; the
-    ///         moment ANY bound round's beacon lands, (a) below blocks this forever and rarity resolves from it.
+    ///         CORRECTED (external audit F-1, 2026-09-08): the ladder now binds a round `revealDelay` in the
+    ///         FUTURE of the call, not the round at the rung instant, because the rung instant is by
+    ///         definition already past and its beacon already public. Two callers at different instants
+    ///         therefore bind DIFFERENT rounds — that is fine and is the point: every candidate is equally
+    ///         unknowable, so the call's timing still selects nothing of VALUE. One advance per
+    ///         REVEAL_FALLBACK_STEP(), measured from the previous binding. The moment ANY bound round's
+    ///         beacon lands, (a) below blocks this forever and rarity resolves from it.
     /// @dev    (a) `!drand.isAvailable(revealRound)` is the safety property: a reveal that has resolved can
     ///         never be re-rolled, and the oracle only ever adds beacons, so a resolved reveal stays resolved.
-    ///         Rungs cannot be skipped: the first call always binds rung 1, whatever the time.
+    ///         Rung numbering is now an advance COUNTER for observability, not a round selector.
     /// @dev    RESIDUAL (stated plainly): beacon posting is permissionless (BlsDrandOracle.submitBeacon), so
     ///         "unavailable" past a rung instant means the beacon was never posted for a whole
     ///         REVEAL_FALLBACK_STEP(). The honest path is trivial (anyone posts the produced beacon, the keeper
@@ -645,13 +658,35 @@ contract NFTCollection is INFTCollection, ERC721, NonRenounceableOwnable2Step, R
         uint64 cur = revealRound;
         if (cur == 0) revert RevealNotBound(); // finalizeLaunch has not bound a reveal yet
         if (drand.isAvailable(cur)) revert RevealAlreadyResolved(); // (a): a resolved reveal never re-rolls
+        // external audit F-1 (2026-09-08) — THE BUG THIS REPLACES. The old body was:
+        //     uint256 rungTime = revealBoundAt + rung * REVEAL_FALLBACK_STEP();
+        //     if (block.timestamp < rungTime) revert RevealFallbackNotDue();
+        //     uint64 next = drand.roundAt(rungTime);          // "the round AT the rung instant"
+        // The gate requires rungTime to have PASSED, and the bind then asks for the round at that same
+        // past instant — so the round being bound was ALREADY PUBLISHED, and its beacon readable in
+        // drand's archive, at the moment it became the seal for all 3,500 rarities. Worse, `rung` was a
+        // bare counter (revealFallbackRung + 1), so once several rungs were due a caller could walk them
+        // one at a time, read each candidate beacon, stop on whichever gave the best rarity map, and weld
+        // it in with the permissionless submitBeacon in the same transaction.
+        //
+        // The original reasoning conflated NON-DISCRETIONARY with UNPREDICTABLE. Determinism defends
+        // against an OWNER choosing the round; it does nothing against a CALLER choosing the moment, once
+        // the candidate beacons are public. Only a FUTURE round is unknowable, so that is what we bind —
+        // exactly what finalizeLaunch already does. The doc property "two callers in the same rung window
+        // bind the SAME round" is deliberately given up: it was the grinding surface, not a safeguard.
+        //
+        // Re-anchoring revealBoundAt to this instant does two things at once: the next rung is a full
+        // REVEAL_FALLBACK_STEP() from THIS binding (so the ladder can never advance faster than one step,
+        // however late the call), and no walking is possible because elapsed is 0 immediately after.
+        // The constructor invariant revealDelay < REVEAL_FALLBACK_STEP() now carries its true meaning:
+        // the newly bound round always falls due BEFORE the next rung, so it gets a real chance to land.
+        if (block.timestamp - revealBoundAt < REVEAL_FALLBACK_STEP()) revert RevealFallbackNotDue();
         uint256 rung = revealFallbackRung + 1;
-        uint256 rungTime = revealBoundAt + rung * REVEAL_FALLBACK_STEP(); // predetermined: stamp + arithmetic
-        if (block.timestamp < rungTime) revert RevealFallbackNotDue(); // (b): the rung's instant must have passed
-        uint64 next = drand.roundAt(rungTime); // (c): the round AT the rung instant, never at the call
+        uint64 next = drand.roundAt(block.timestamp + revealDelay); // FUTURE and unknowable, per finalizeLaunch
         revealFallbackRung = rung;
         revealRound = next;
-        emit RevealFallbackAdvanced(rung, cur, next, rungTime);
+        revealBoundAt = block.timestamp; // re-anchor: one advance per step, measured from this binding
+        emit RevealFallbackAdvanced(rung, cur, next, block.timestamp);
     }
 
     /// @notice Disburse the three launch buckets to their (frozen) recipients, each INDEPENDENTLY (audit

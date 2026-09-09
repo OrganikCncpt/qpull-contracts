@@ -66,6 +66,9 @@ contract QpullWethAdapter is ISwapAdapter, IUnlockCallback, Ownable2Step, Reentr
     constructor(address poolManager_, address qpull_, address weth_, address initialOwner)
         Ownable(initialOwner)
     {
+        // Slither `missing-zero-check`, the variant of external audit Treasury F-9 in a contract no external
+        // engagement ever had in scope. These bindings are immutable with no re-deploy path.
+        if (poolManager_ == address(0) || qpull_ == address(0) || weth_ == address(0)) revert ZeroAddress();
         poolManager = IPoolManager(poolManager_);
         qpull = qpull_;
         weth = weth_;
